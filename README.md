@@ -84,27 +84,9 @@ dials get a clean `server busy` rejection rather than a queue).
 
 ## Linux: systemd
 
-A unit ships at `deploy/dropline.service`:
-
-```ini
-[Unit]
-Description=dropline loss-test server
-After=network-online.target
-
-[Service]
-ExecStart=/usr/local/bin/dropline serve --listen :5301
-DynamicUser=yes
-Restart=on-failure
-LimitNOFILE=65536
-ProtectSystem=strict
-ProtectHome=yes
-NoNewPrivileges=yes
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Install and start:
+A hardened `DynamicUser` unit ships at
+[`deploy/dropline.service`](deploy/dropline.service). Install and
+start:
 
 ```bash
 sudo install -m 0644 deploy/dropline.service /etc/systemd/system/
@@ -113,11 +95,11 @@ sudo systemctl enable --now dropline
 journalctl -u dropline -f
 ```
 
-The unit runs as a `DynamicUser`. The reverse-trace feature on the
-server side requires `CAP_NET_RAW`; without it the server starts
-fine and advertises `reverse_trace=off` to clients. Add
-`AmbientCapabilities=CAP_NET_RAW` to the unit if you want
-reverse trace enabled.
+The reverse-trace feature on the server side requires
+`CAP_NET_RAW`; without it the server starts fine and advertises
+`reverse_trace=off` to clients. Add `AmbientCapabilities=CAP_NET_RAW`
+(and optionally `CapabilityBoundingSet=CAP_NET_RAW` to harden) to
+the unit if you want reverse trace enabled.
 
 ## TUI live controls
 
