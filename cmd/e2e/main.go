@@ -206,6 +206,12 @@ type traceJSON struct {
 		} `json:"rtt_ms"`
 		Terminus string `json:"terminus,omitempty"`
 	} `json:"reverse_path"`
+	ReverseStream *struct {
+		Sent      int64   `json:"sent"`
+		Recv      int64   `json:"recv"`
+		LossPct   float64 `json:"loss_pct"`
+		DurationS float64 `json:"duration_s"`
+	} `json:"reverse_stream,omitempty"`
 }
 
 func assertHealthy(d traceJSON) error {
@@ -254,6 +260,21 @@ func assertHealthy(d traceJSON) error {
 		if !seenSent {
 			return errors.New("reverse_path_status=ok but no hop carries sent>0 (rich-shape regression)")
 		}
+	}
+	// reverse_stream is the server→client UDP loss sub-test. On the
+	// default auto/auto/auto matrix it should be present and clean on
+	// loopback: at least one packet sent AND received, low loss%.
+	if d.ReverseStream == nil {
+		return errors.New("reverse_stream section missing (auto resolution should enable it on loopback)")
+	}
+	if d.ReverseStream.Sent == 0 {
+		return errors.New("reverse_stream.sent == 0; server reverse-Sender never emitted")
+	}
+	if d.ReverseStream.Recv == 0 {
+		return errors.New("reverse_stream.recv == 0; reverse packets didn't reach the client")
+	}
+	if d.ReverseStream.LossPct >= 1.0 {
+		return fmt.Errorf("reverse_stream.loss_pct = %.3f, want < 1.0 on loopback", d.ReverseStream.LossPct)
 	}
 	return nil
 }

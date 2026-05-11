@@ -29,6 +29,11 @@ type StateSnapshot struct {
 	// happens immediately after Ready arrives). The terminated_at_nat
 	// state is reserved for a follow-up slice.
 	ReversePathStatus string
+	// ReverseStream is the cumulative view of reverse-direction UDP
+	// stream counters (server-to-client) when reverse-stream is enabled
+	// for this session. Nil otherwise. Renderers branch on nil to decide
+	// whether to render the reverse-stream KPI / section.
+	ReverseStream *StreamView
 }
 
 // ReverseHopView is the immutable per-hop view of the server's reverse

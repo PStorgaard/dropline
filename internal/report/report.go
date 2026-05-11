@@ -40,6 +40,37 @@ type Data struct {
 	// computed by the trace driver after end-of-test. Empty when no hop
 	// crossed the >50% co-occurrence bar.
 	Correlation []SuspectHopReport
+	// ReverseStream summarizes server→client UDP loss for the reverse-
+	// direction sub-test. nil when reverse stream was disabled for this
+	// session; renderers drop the section in that case. The "Sent" count
+	// is the server's exact counter carried in Final.ReverseSent, while
+	// the receive/loss/jitter counters are the client's local view.
+	ReverseStream *ReverseStreamReport
+}
+
+// ReverseStreamReport is the report-layer view of the reverse-direction
+// UDP sub-test. The fields mirror the relevant subset of
+// control.FinalStats / agg.StreamView so renderers don't import either
+// package's wire surface.
+type ReverseStreamReport struct {
+	// Sent is the server-side exact count of UDP packets transmitted
+	// back to the client (Final.ReverseSent on the wire).
+	Sent int64 `json:"sent"`
+	// Recv, Lost, OutOfOrder, Duplicates are the client's local
+	// observations on the reverse stream.
+	Recv       int64 `json:"recv"`
+	Lost       int64 `json:"loss"`
+	OutOfOrder int64 `json:"out_of_order"`
+	Duplicates int64 `json:"duplicates"`
+	// LossPct = Lost / (Recv + Lost) * 100, or 0 when no traffic. Renderers
+	// fall back to (Sent - Recv) / Sent when Recv + Lost is zero (the
+	// receiver may not have logged Lost yet for very short tests).
+	LossPct float64 `json:"loss_pct"`
+	// JitterMS is the RFC 3550 EWMA jitter the client observed.
+	JitterMS float64 `json:"jitter_ms"`
+	// DurationS is the wall-clock duration the server-side sender
+	// actually ran for.
+	DurationS float64 `json:"duration_s"`
 }
 
 // SuspectHopReport mirrors agg.SuspectHop in the renderer's type space so

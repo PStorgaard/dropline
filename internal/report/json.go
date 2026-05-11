@@ -15,17 +15,18 @@ import (
 // computed float instead of the raw int64 count carried in
 // control.FinalStats.
 type jsonDoc struct {
-	Version           int               `json:"version"`
-	Target            string            `json:"target"`
-	StartedAt         string            `json:"started_at"`
-	DurationS         float64           `json:"duration_s"`
-	Config            Config            `json:"config"`
-	Hops              []jsonHop         `json:"hops"`
-	ReversePath       []jsonReverseHop  `json:"reverse_path"`
-	ReversePathStatus string            `json:"reverse_path_status"`
-	Stream            jsonStream        `json:"stream"`
-	Correlation       jsonCorrelation   `json:"correlation"`
-	Timeline          []jsonTimelineRow `json:"timeline"`
+	Version           int                  `json:"version"`
+	Target            string               `json:"target"`
+	StartedAt         string               `json:"started_at"`
+	DurationS         float64              `json:"duration_s"`
+	Config            Config               `json:"config"`
+	Hops              []jsonHop            `json:"hops"`
+	ReversePath       []jsonReverseHop     `json:"reverse_path"`
+	ReversePathStatus string               `json:"reverse_path_status"`
+	Stream            jsonStream           `json:"stream"`
+	ReverseStream     *ReverseStreamReport `json:"reverse_stream,omitempty"`
+	Correlation       jsonCorrelation      `json:"correlation"`
+	Timeline          []jsonTimelineRow    `json:"timeline"`
 }
 
 // jsonReverseHop mirrors jsonHop's shape — same `rtt_ms` struct, same
@@ -138,8 +139,9 @@ func RenderJSON(w io.Writer, d Data) error {
 			RateTxBPS: d.Stream.RateTxBPS,
 			RateRxBPS: d.Stream.RateRxBPS,
 		},
-		Correlation: jsonCorrelation{SuspectHops: suspectHopsToJSON(d.Correlation)},
-		Timeline:    make([]jsonTimelineRow, 0, len(d.Timeline)),
+		ReverseStream: d.ReverseStream,
+		Correlation:   jsonCorrelation{SuspectHops: suspectHopsToJSON(d.Correlation)},
+		Timeline:      make([]jsonTimelineRow, 0, len(d.Timeline)),
 	}
 	for _, b := range d.Timeline {
 		doc.Timeline = append(doc.Timeline, jsonTimelineRow{

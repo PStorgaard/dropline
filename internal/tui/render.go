@@ -119,6 +119,21 @@ func renderKPI(opts Options, view agg.StreamView, elapsed time.Duration, paused 
 	return renderSection(titleLeft, headerStyle, sb.String(), width)
 }
 
+// renderReverseKPI is the secondary KPI card surfaced only when the
+// session is running a reverse-direction UDP stream (server→client).
+// It's a single line in its own section frame so the existing forward
+// KPI block stays untouched and the reverse stats are unmistakable.
+// Returns "" when view is nil so callers can append unconditionally.
+func renderReverseKPI(view *agg.StreamView, width int) string {
+	if view == nil {
+		return ""
+	}
+	lossCell := lossColor(view.LossPct).Render(fmt.Sprintf("%.3f%%", view.LossPct))
+	body := fmt.Sprintf("reverse loss  %s   jitter %.2f ms   recv %d   lost %d",
+		lossCell, view.JitterMS, view.Recv, view.Lost)
+	return renderSection("reverse stream (server→client)", headerStyle, body, width)
+}
+
 func formatDuration(d time.Duration) string {
 	s := int(d.Seconds())
 	return fmt.Sprintf("%02d:%02d", s/60, s%60)

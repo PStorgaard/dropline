@@ -77,15 +77,16 @@ func (m reverseTraceMode) String() string {
 }
 
 type traceConfig struct {
-	target       string
-	rateBPS      uint64
-	duration     time.Duration
-	packetSize   int
-	mtrInterval  time.Duration
-	maxHops      int
-	output       outputMode
-	savePath     string
-	reverseTrace reverseTraceMode
+	target        string
+	rateBPS       uint64
+	duration      time.Duration
+	packetSize    int
+	mtrInterval   time.Duration
+	maxHops       int
+	output        outputMode
+	savePath      string
+	reverseTrace  reverseTraceMode
+	reverseStream reverseTraceMode
 }
 
 func parseTraceArgs(args []string, stdoutIsTTY bool, errOut io.Writer) (traceConfig, error) {
@@ -102,6 +103,7 @@ func parseTraceArgs(args []string, stdoutIsTTY bool, errOut io.Writer) (traceCon
 	jsonOut := fs.Bool("json", false, "force JSON document output")
 	save := fs.String("save", "", "write final JSON report to FILE")
 	reverse := fs.String("reverse-trace", "auto", "reverse trace mode: on, off, or auto")
+	reverseStream := fs.String("reverse-stream", "auto", "reverse-direction UDP loss test: on, off, or auto")
 
 	// Stdlib flag.Parse stops at the first non-flag token, but the spec
 	// puts TARGET before flags (`dropline trace TARGET --rate ...`).
@@ -146,6 +148,10 @@ func parseTraceArgs(args []string, stdoutIsTTY bool, errOut io.Writer) (traceCon
 	if err != nil {
 		return traceConfig{}, err
 	}
+	revStream, err := parseReverseStream(*reverseStream)
+	if err != nil {
+		return traceConfig{}, err
+	}
 
 	if *packetSize < 32 {
 		return traceConfig{}, fmt.Errorf("--packet-size must be >= 32 (stream header is 32 bytes), got %d", *packetSize)
@@ -164,15 +170,16 @@ func parseTraceArgs(args []string, stdoutIsTTY bool, errOut io.Writer) (traceCon
 	}
 
 	return traceConfig{
-		target:       target,
-		rateBPS:      rateBPS,
-		duration:     *duration,
-		packetSize:   *packetSize,
-		mtrInterval:  *mtrInterval,
-		maxHops:      *maxHops,
-		output:       mode,
-		savePath:     *save,
-		reverseTrace: rev,
+		target:        target,
+		rateBPS:       rateBPS,
+		duration:      *duration,
+		packetSize:    *packetSize,
+		mtrInterval:   *mtrInterval,
+		maxHops:       *maxHops,
+		output:        mode,
+		savePath:      *save,
+		reverseTrace:  rev,
+		reverseStream: revStream,
 	}, nil
 }
 
@@ -260,6 +267,22 @@ func parseReverseTrace(raw string) (reverseTraceMode, error) {
 	}
 }
 
+// parseReverseStream mirrors parseReverseTrace for the --reverse-stream
+// flag. Same three-mode semantics (auto/on/off) — kept distinct so the
+// error message points at the right flag name.
+func parseReverseStream(raw string) (reverseTraceMode, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "auto":
+		return reverseAuto, nil
+	case "on":
+		return reverseOn, nil
+	case "off":
+		return reverseOff, nil
+	default:
+		return 0, fmt.Errorf("--reverse-stream must be on, off, or auto; got %q", raw)
+	}
+}
+
 func stdoutIsTTY() bool {
 	fi, err := os.Stdout.Stat()
 	if err != nil {
@@ -306,6 +329,22 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 	if err != nil {
 		return fmt.Errorf("mint flow id: %w", err)
 	}
+	// reverseFlowID is the distinct flow id the server stamps on its
+	// reverse-direction UDP packets. Minted separately and re-minted on
+	// the (astronomically unlikely) collision with the forward flow id
+	// so the client's receiver can filter cleanly.
+	var reverseFlowID uint32
+	if cfg.reverseStream != reverseOff {
+		reverseFlowID, err = mintFlowID()
+		if err != nil {
+			return fmt.Errorf("mint reverse flow id: %w", err)
+		}
+		for reverseFlowID == flowID {
+			if reverseFlowID, err = mintFlowID(); err != nil {
+				return fmt.Errorf("mint reverse flow id: %w", err)
+			}
+		}
+	}
 	hello := &control.Hello{
 		Type:          control.TypeHello,
 		Version:       1,
@@ -316,6 +355,8 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 		FlowID:        flowID,
 		ReverseTrace:  cfg.reverseTrace.String(),
 		MTRIntervalMS: cfg.mtrInterval.Milliseconds(),
+		ReverseStream: cfg.reverseStream.String(),
+		ReverseFlowID: reverseFlowID,
 	}
 	if err := cc.Send(hello); err != nil {
 		return fmt.Errorf("send hello: %w", err)
@@ -326,9 +367,18 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 		return fmt.Errorf("recv ready: %w", err)
 	}
 	var reversePathStatus string
+	var reverseStreamOn bool
 	switch m := first.(type) {
 	case *control.Ready:
 		reversePathStatus = resolveReversePathStatus(cfg.reverseTrace.String(), m.ReverseTrace)
+		// Reverse stream is on only if BOTH the server agreed AND its
+		// echoed flow id matches what we sent. Mismatched echo means the
+		// server is on a slightly different version that doesn't honor
+		// the client's flow id — treat as off rather than risk filtering
+		// against the wrong id.
+		if m.ReverseStream == "on" && m.ReverseFlowID == reverseFlowID && reverseFlowID != 0 {
+			reverseStreamOn = true
+		}
 	case *control.Error:
 		return fmt.Errorf("server rejected session: %s", m.Reason)
 	default:
@@ -423,6 +473,46 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 		}
 	}()
 
+	// Reverse-direction UDP stream: when the server agreed to send back
+	// (Ready.ReverseStream == "on"), open a Receiver on the SAME dialed
+	// UDP socket the sender is using. The socket is full-duplex; the
+	// sender's Write doesn't conflict with the receiver's ReadFromUDP
+	// (SetReadDeadline on the drainer affects reads only). The receiver
+	// filters by reverseFlowID so any stray traffic on this socket is
+	// silently dropped. Snapshots flow into a per-tick drainer that
+	// forwards them to aggregator.IngestReverseStream.
+	if reverseStreamOn {
+		reverseSnaps := make(chan stream.Snapshot, 4)
+		reverseRcv, err := stream.NewReceiver(udpConn, stream.ReceiverConfig{
+			FlowID:    reverseFlowID,
+			Tick:      time.Second,
+			Snapshots: reverseSnaps,
+			// No kernel-drop sampler on the client side: the kernel-drop
+			// counter is process-wide and would conflate with any other
+			// UDP traffic on this host. Leaving it nil ⇒ nopSampler.
+		})
+		if err != nil {
+			return fmt.Errorf("init reverse receiver: %w", err)
+		}
+		workersWG.Add(1)
+		go func() {
+			defer workersWG.Done()
+			_, _ = reverseRcv.Run(workerCtx)
+		}()
+		workersWG.Add(1)
+		go func() {
+			defer workersWG.Done()
+			for {
+				select {
+				case <-workerCtx.Done():
+					return
+				case s := <-reverseSnaps:
+					aggregator.IngestReverseStream(s)
+				}
+			}
+		}()
+	}
+
 	var (
 		final    *control.Final
 		serverEr string
@@ -464,6 +554,7 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 			ReversePath:       reverseHopsFromAgg(finalState.LatestReverseHops),
 			ReversePathStatus: finalState.ReversePathStatus,
 			Correlation:       suspectsToReports(suspects),
+			ReverseStream:     reverseStreamReport(finalState.ReverseStream, &f.Stats),
 		}
 	}
 
@@ -485,6 +576,15 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 			defer workersWG.Done()
 			defer close(recvDone)
 			final, serverEr, recvErr = runRecvLoop(cc, aggregator)
+			// See the non-TUI flow below for why this grace exists:
+			// reverse-direction UDP packets may still be arriving when
+			// Final has already returned over TCP. Holding before
+			// buildReportData (which Snapshot()s the aggregator) keeps
+			// the reverse-stream recv count honest in the rendered
+			// report and on the TUI's test-complete view.
+			if reverseStreamOn {
+				time.Sleep(200 * time.Millisecond)
+			}
 			// Run the correlator + MarkSuspects inside this goroutine
 			// so the StateSnapshot it emits reaches the TUI before the
 			// snaps watcher closes the channel and flips m.done.
@@ -524,6 +624,17 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 		workersWG.Wait()
 	} else {
 		final, serverEr, recvErr = runRecvLoop(cc, aggregator)
+		// When the reverse-direction stream is active, the server emits
+		// packets right up until its session timer fires; some of those
+		// arrive at the client AFTER Final has already returned over TCP
+		// because UDP and TCP are independent transports. Without a grace
+		// window the reverse Receiver's drainer exits as soon as ctx is
+		// cancelled, leaving tail packets unread in the kernel buffer
+		// and the recv count under-reporting. 200ms covers loopback +
+		// real internet RTTs comfortably.
+		if reverseStreamOn {
+			time.Sleep(200 * time.Millisecond)
+		}
 		workerCancel()
 		workersWG.Wait()
 	}
@@ -698,6 +809,31 @@ func hopsFromAgg(in []agg.HopView) []report.HopReport {
 		}
 	}
 	return out
+}
+
+// reverseStreamReport builds the renderer's reverse-stream view from the
+// aggregator's last-known reverse StreamView plus the server's reported
+// counters in Final.ReverseSent / Final.ReverseDurationS. Returns nil
+// when reverse stream wasn't active for this session — both the
+// aggregator view and Sent are zero.
+func reverseStreamReport(v *agg.StreamView, fs *control.FinalStats) *report.ReverseStreamReport {
+	if v == nil && (fs == nil || (fs.ReverseSent == 0 && fs.ReverseDurationS == 0)) {
+		return nil
+	}
+	out := report.ReverseStreamReport{}
+	if fs != nil {
+		out.Sent = fs.ReverseSent
+		out.DurationS = fs.ReverseDurationS
+	}
+	if v != nil {
+		out.Recv = v.Recv
+		out.Lost = v.Lost
+		out.OutOfOrder = v.OutOfOrder
+		out.Duplicates = v.Duplicates
+		out.LossPct = v.LossPct
+		out.JitterMS = v.JitterMS
+	}
+	return &out
 }
 
 // suspectsToReports adapts the agg correlator's output into the renderer's

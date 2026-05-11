@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"os/signal"
@@ -154,6 +155,7 @@ func handleSession(ctx context.Context, c *control.Conn, hello *control.Hello, h
 	}
 
 	reverseDecision := resolveReverseTrace(hello.ReverseTrace, reverseCapable)
+	reverseStreamDecision, reverseStreamFlowID := resolveReverseStream(hello.ReverseStream, hello.ReverseFlowID, hello.FlowID)
 
 	// Register the flow_id BEFORE sending Ready so a collision produces a
 	// terminal Error rather than a Ready-then-Error sequence. The Hub's
@@ -166,9 +168,11 @@ func handleSession(ctx context.Context, c *control.Conn, hello *control.Hello, h
 	defer flowHandle.Release()
 
 	if err := c.Send(&control.Ready{
-		Type:         control.TypeReady,
-		SessionID:    sid,
-		ReverseTrace: reverseDecision,
+		Type:          control.TypeReady,
+		SessionID:     sid,
+		ReverseTrace:  reverseDecision,
+		ReverseStream: reverseStreamDecision,
+		ReverseFlowID: reverseStreamFlowID,
 	}); err != nil {
 		return err
 	}
@@ -258,13 +262,86 @@ func handleSession(ctx context.Context, c *control.Conn, hello *control.Hello, h
 		}
 	}
 
+	// Reverse UDP stream: when the resolved decision is "on", run a
+	// Sender writing back to the client's first-observed UDP source
+	// address via the Hub's shared listening socket (WriteToUDP), stamped
+	// with the negotiated reverse flow id. Rate / duration / packet-size
+	// mirror the forward stream.
+	var reverseStreamWG sync.WaitGroup
+	var reverseStreamSent atomic.Int64
+	var reverseStreamDurationS atomic.Uint64 // float64 bits
+	if reverseStreamDecision == "on" {
+		reverseStreamWG.Add(1)
+		go runReverseStream(sessionCtx, &reverseStreamWG, hub, flowHandle, hello, reverseStreamFlowID,
+			&reverseStreamSent, &reverseStreamDurationS)
+	}
+
 	finalSnap, _ := rcv.Run(sessionCtx)
 	cancel()
 	<-forwarderDone
 	reverseWG.Wait()
+	reverseStreamWG.Wait()
 
-	final := buildFinal(hello, finalSnap)
+	final := buildFinal(hello, finalSnap, &reverseStreamSent, &reverseStreamDurationS)
 	return c.Send(&final)
+}
+
+// resolveReverseStream picks the server's reverse-UDP-stream decision.
+// Returns ("off", 0) when the client opted out, sent no/colliding
+// ReverseFlowID, or asked for something unparseable. Returns ("on",
+// clientReverseFlowID) otherwise — the server doesn't pick its own flow
+// id; it echoes the client's choice. Mirrors resolveReverseTrace's
+// auto-vs-off semantics.
+func resolveReverseStream(clientPref string, clientReverseFlowID, forwardFlowID uint32) (string, uint32) {
+	switch clientPref {
+	case "off":
+		return "off", 0
+	case "on", "auto":
+		// fallthrough
+	default:
+		return "off", 0
+	}
+	if clientReverseFlowID == 0 || clientReverseFlowID == forwardFlowID {
+		return "off", 0
+	}
+	return "on", clientReverseFlowID
+}
+
+// runReverseStream blocks on the forward stream's first packet to learn
+// the client's UDP source addr, then runs a Sender against that addr
+// using the Hub's listening socket (WriteToUDP). On exit it records the
+// total packets sent and the duration the sender actually ran for so
+// buildFinal can carry both values to the client.
+//
+// math.Float64bits is used to atomically publish the float64 duration
+// through an atomic.Uint64 — there's no atomic.Float64 in the std lib.
+func runReverseStream(ctx context.Context, wg *sync.WaitGroup, hub *stream.Hub, flowHandle *stream.HubFlow,
+	hello *control.Hello, reverseFlowID uint32, sentOut *atomic.Int64, durationBitsOut *atomic.Uint64) {
+	defer wg.Done()
+	clientAddr, err := flowHandle.RemoteAddr(ctx)
+	if err != nil {
+		// Either ctx cancelled before the client sent its first packet,
+		// or the addr capture itself failed. Either way silently skip
+		// reverse — the client will see ReverseSent=0 in Final and
+		// renderers degrade naturally.
+		return
+	}
+	duration := time.Duration(hello.DurationMS) * time.Millisecond
+	sender, err := stream.NewSender(hub.Conn(), stream.SenderConfig{
+		RateBPS:     hello.RateBPS,
+		PacketSize:  hello.PacketSize,
+		Duration:    duration,
+		FlowID:      reverseFlowID,
+		WriteTarget: clientAddr,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "dropline serve: reverse-stream sender init failed: %s\n", err)
+		return
+	}
+	start := time.Now()
+	_ = sender.Run(ctx)
+	sentOut.Store(sender.Sent())
+	durationBitsOut.Store(math.Float64bits(time.Since(start).Seconds()))
 }
 
 // resolveReverseTrace picks the server's reverse-trace decision from the
@@ -387,11 +464,18 @@ func classifyTerminus(h probe.HopStat, clientIP net.IP) string {
 }
 
 // buildFinal converts a stream.Snapshot to a control.Final. The server
-// has no sender-side counter, so `sent` is approximated as MaxSeq + 1
-// when any traffic was observed; this under-counts by however many of
-// the sender's *last* packets were lost (and never reached us to bump
-// MaxSeq). Documented as a known v1 limitation.
-func buildFinal(hello *control.Hello, s stream.Snapshot) control.Final {
+// has no sender-side counter for the forward direction, so `sent` is
+// approximated as MaxSeq + 1 when any traffic was observed; this
+// under-counts by however many of the sender's *last* packets were lost
+// (and never reached us to bump MaxSeq). Documented as a known v1
+// limitation. For the reverse stream the server IS the sender so it
+// reports an exact Sent count.
+//
+// reverseSent and reverseDurationBits may be nil when reverse stream is
+// off for this session, in which case the corresponding FinalStats
+// fields stay zero (omitempty drops them from the wire).
+func buildFinal(hello *control.Hello, s stream.Snapshot,
+	reverseSent *atomic.Int64, reverseDurationBits *atomic.Uint64) control.Final {
 	var sent int64
 	if s.Recv > 0 || s.Lost > 0 {
 		sent = int64(s.MaxSeq) + 1 // #nosec G115 -- bounded by sender duration
@@ -399,6 +483,14 @@ func buildFinal(hello *control.Hello, s stream.Snapshot) control.Final {
 	var rateRx int64
 	if s.T > 0 {
 		rateRx = int64(float64(s.Recv*int64(hello.PacketSize)*8) / s.T)
+	}
+	var revSent int64
+	var revDur float64
+	if reverseSent != nil {
+		revSent = reverseSent.Load()
+	}
+	if reverseDurationBits != nil {
+		revDur = math.Float64frombits(reverseDurationBits.Load())
 	}
 	return control.Final{
 		Type: control.TypeFinal,
@@ -419,8 +511,10 @@ func buildFinal(hello *control.Hello, s stream.Snapshot) control.Final {
 				HundredUp: s.Bursts.HundredUp,
 				Max:       s.Bursts.Max,
 			},
-			RateTxBPS: hello.RateBPS,
-			RateRxBPS: rateRx,
+			RateTxBPS:        hello.RateBPS,
+			RateRxBPS:        rateRx,
+			ReverseSent:      revSent,
+			ReverseDurationS: revDur,
 		},
 	}
 }

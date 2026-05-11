@@ -54,6 +54,28 @@ func RenderText(w io.Writer, d Data) error {
 	fmt.Fprintf(&sb, "  bursts:       %s\n",
 		agg.FormatBurstSummary(b.Ten99, b.HundredUp, b.Max))
 
+	if r := d.ReverseStream; r != nil {
+		sb.WriteString("\nreverse udp stream (server→client):\n")
+		fmt.Fprintf(&sb, "  sent (server):%d\n", r.Sent)
+		fmt.Fprintf(&sb, "  received:     %d\n", r.Recv)
+		// Prefer the receiver-observed loss% when it has data; fall
+		// back to (Sent - Recv) / Sent when the client's Lost counter
+		// hasn't accrued yet for a very short test.
+		lossPct := r.LossPct
+		if r.Recv+r.Lost == 0 && r.Sent > 0 {
+			diff := r.Sent - r.Recv
+			if diff < 0 {
+				diff = 0
+			}
+			lossPct = float64(diff) / float64(r.Sent) * 100
+		}
+		fmt.Fprintf(&sb, "  lost:         %d (%.3f%% udp loss)\n", r.Lost, lossPct)
+		fmt.Fprintf(&sb, "  out of order: %d\n", r.OutOfOrder)
+		fmt.Fprintf(&sb, "  duplicates:   %d\n", r.Duplicates)
+		fmt.Fprintf(&sb, "  jitter:       %.2f ms\n", r.JitterMS)
+		fmt.Fprintf(&sb, "  duration:     %.2fs\n", r.DurationS)
+	}
+
 	_, err := io.WriteString(w, sb.String())
 	return err
 }

@@ -41,6 +41,11 @@ type Aggregator struct {
 	// reverseStatus is the resolved reverse-path status string, set by the
 	// trace driver once Ready has been parsed.
 	reverseStatus string
+	// lastReverse is the most recent reverse-direction stream.Snapshot
+	// ingested via IngestReverseStream. nil before the first ingest;
+	// once set, the snapshotLocked builder publishes a StreamView pointer
+	// into every emitted StateSnapshot.
+	lastReverse *stream.Snapshot
 }
 
 // New constructs an Aggregator. t0 is informational only this slice — it
@@ -110,6 +115,23 @@ func (a *Aggregator) ingestStreamLocked(s stream.Snapshot) StateSnapshot {
 	a.lastView = streamView(s)
 
 	return a.snapshotLocked(s.T, a.lastView)
+}
+
+// IngestReverseStream records one reverse-direction stream.Snapshot.
+// It updates the aggregator's reverse view (kept separate from the
+// forward view used for buckets/correlation) and emits a fresh
+// StateSnapshot. Reverse counters are intentionally not bucketed in
+// v1 — the per-second timeline stays forward-only — so this ingest
+// only refreshes the cumulative ReverseStream pointer.
+//
+// Sends are non-blocking — see IngestStream.
+func (a *Aggregator) IngestReverseStream(s stream.Snapshot) {
+	a.mu.Lock()
+	snap := s
+	a.lastReverse = &snap
+	state := a.snapshotLocked(a.lastTLocked(), a.lastView)
+	a.mu.Unlock()
+	a.emit(state)
 }
 
 // IngestForwardHop records one probe.Snapshot. It overwrites the
@@ -324,6 +346,11 @@ func (a *Aggregator) snapshotLocked(t float64, stream StreamView) StateSnapshot 
 	sort.Slice(reverseCopy, func(i, j int) bool {
 		return reverseCopy[i].TTL < reverseCopy[j].TTL
 	})
+	var reverseStream *StreamView
+	if a.lastReverse != nil {
+		v := streamView(*a.lastReverse)
+		reverseStream = &v
+	}
 	return StateSnapshot{
 		T:                 t,
 		Stream:            stream,
@@ -331,6 +358,7 @@ func (a *Aggregator) snapshotLocked(t float64, stream StreamView) StateSnapshot 
 		LatestForwardHops: hopsCopy,
 		LatestReverseHops: reverseCopy,
 		ReversePathStatus: a.reverseStatus,
+		ReverseStream:     reverseStream,
 	}
 }
 
