@@ -26,7 +26,7 @@ Legend: `[x]` done · `[~]` partial / wired-but-incomplete · `[ ]` todo
 - [x] `--tui` runs the live dashboard via `internal/tui`; control recv loop runs in a background goroutine while bubbletea owns the main goroutine. `--save` still writes JSON regardless of output mode
 - [x] Multi-session via UDP demultiplexing — `stream.Hub` runs a single drainer per UDP socket and dispatches packets to per-flow channels; `--max-sessions` (default 4) admits up to N concurrent clients via a semaphore in `newServeHandler`, over-cap dials get `Error{Reason: "server busy: max sessions reached"}`
 - [x] `service install` / `service uninstall` / `service run` — `install` bakes the chosen `--listen` and `--max-sessions` into the SCM-registered argv; `run` is the SCM entry point and drives `serveRun` via context cancellation. Linux gets a clear `svc: Windows-only; use the systemd unit on Linux` error
-- [x] Privilege detection at startup (CAP_NET_RAW on Linux, Administrator on Windows) — `trace` fails loud on raw-ICMP missing; `serve` calls `privcheck.RawICMP()` once at startup and threads the bool into the per-session reverse-trace decision so the server still starts unprivileged
+- [x] Privilege detection at startup — Linux gates on `CAP_NET_RAW`; Windows gates on `iphlpapi.dll` + `IcmpSendEcho2Ex` proc availability (no Administrator required, since the Windows prober uses `iphlpapi.dll!IcmpSendEcho2Ex` instead of raw sockets — issue #1). `trace` fails loud when the capability is missing; `serve` calls `privcheck.RawICMP()` once at startup and threads the bool into the per-session reverse-trace decision so the server still starts unprivileged
 - [x] `--reverse-trace` flag is honored: client sends preference in Hello, server resolves to "on"/"off" in Ready, client maps Ready+pref → `reverse_path_status` (`ok` / `disabled_by_client` / `disabled_by_server`)
 
 ### internal/control
@@ -56,7 +56,7 @@ Legend: `[x]` done · `[~]` partial / wired-but-incomplete · `[ ]` todo
 - [x] `IngestReverseHop(control.ReverseHopUpdate)` — upserts per-TTL `ReverseHopView` and emits a fresh `StateSnapshot`; `SetReversePathStatus` does the same for the status banner so the TUI sees it immediately on session start
 
 ### internal/probe
-- [x] Forward TTL-walking ICMP prober (client side) — `Prober` opens raw ICMPv4, sweeps TTL 1..MaxHops at `--mtr-interval`, demuxes by global seq, emits per-sweep `Snapshot{Hops []HopStat}`
+- [x] Forward TTL-walking ICMP prober (client side) — `Prober` sweeps TTL 1..MaxHops at `--mtr-interval` and emits per-sweep `Snapshot{Hops []HopStat}`. Linux/macOS implementation in `probe_unix.go` opens raw ICMPv4 and demuxes by global seq; Windows implementation in `probe_windows.go` issues `iphlpapi.dll!IcmpSendEcho2Ex` once per TTL (one synchronous syscall per hop, surfaces TimeExceeded correctly — issue #1)
 - [x] Hop response parsing (TTL-exceeded vs echo-reply terminus) — `parse.go` classifies and extracts the embedded original echo's id+seq from TimeExceeded payloads
 - [x] Per-hop rolling stats (sent, recv, last/best/worst, Welford avg+stddev, loss_pct, terminus)
 - [x] Reverse TTL-walking ICMP prober (server side) — `cmd/dropline serve` reuses `probe.Prober` per-session against the client's TCP `RemoteAddr`, hardcoded 1s interval. NAT terminus tagging is deferred (see Reverse trace section)

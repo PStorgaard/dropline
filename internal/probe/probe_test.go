@@ -1,3 +1,5 @@
+//go:build !windows
+
 package probe
 
 import (
@@ -192,8 +194,7 @@ func TestLossTimeout_Scaling(t *testing.T) {
 		{5 * time.Second, 10 * time.Second},
 	}
 	for _, tc := range cases {
-		p := &Prober{cfg: Config{MTRInterval: tc.interval}}
-		if got := p.lossTimeout(); got != tc.want {
+		if got := lossTimeout(tc.interval); got != tc.want {
 			t.Errorf("MTRInterval=%v: lossTimeout=%v, want %v", tc.interval, got, tc.want)
 		}
 	}

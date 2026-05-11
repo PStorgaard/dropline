@@ -9,8 +9,10 @@ does; track feature status in `progress.md` and update as you ship.
 go build ./...      # all packages compile
 go test ./...       # full suite (alias: `make test`)
 make all            # cross-compile + dist/SHA256SUMS
-make e2e            # loopback smoke; needs raw-ICMP privilege
-                    # (elevated PowerShell on Windows, setcap on Linux)
+make e2e            # loopback smoke; on Linux needs raw-ICMP
+                    # capability (setcap cap_net_raw+ep). Windows runs
+                    # unprivileged — the prober goes through
+                    # iphlpapi.dll!IcmpSendEcho2Ex, not raw sockets.
 ```
 
 ## Environment quirks (Windows host)
@@ -28,22 +30,26 @@ make e2e            # loopback smoke; needs raw-ICMP privilege
 
 ## Active landmines
 
-- **Raw ICMP needs Administrator on Windows for `dropline trace`.**
-  Privcheck exits loud; no fallback. `serve` runs unprivileged but
-  advertises `reverse_trace=off` without CAP_NET_RAW.
-- **Windows raw ICMP drops TimeExceeded** (issue #1). Windows
-  delivers `EchoReply` to user-space raw sockets but not
-  `TimeExceeded` from intermediate hops, so `dropline trace`'s
-  forward hop table on Windows shows only the destination + maybe
-  the first private hop, even on a healthy path (`tracert` works
-  fine because it uses the higher-level `IcmpSendEcho2Ex` from
-  `iphlpapi.dll`). The reverse trace (Linux server) is unaffected,
-  and the UDP loss test — what the tool is actually for — is
-  unaffected. Real fix is a Windows-only prober via
-  `IcmpSendEcho2Ex` following the same pattern as
-  `stream/kerneldrops_windows.go`. Until then: README has a
-  "Known issue" callout under Windows, and the recommendation is
-  to use a Linux client for full path-trace.
+- **Linux still needs CAP_NET_RAW for ICMP.** `serve` and `trace` on
+  Linux/macOS use a raw ICMPv4 socket (`internal/probe/probe_unix.go`).
+  Without the capability, `dropline trace` exits loud and `dropline
+  serve` advertises `reverse_trace=off`. Windows is different — see
+  next bullet.
+- **Windows prober is build-tagged separately** at
+  `internal/probe/probe_windows.go`. It uses
+  `iphlpapi.dll!IcmpSendEcho2Ex` (the API `tracert.exe` uses) instead
+  of raw sockets, because Windows raw ICMP drops `TimeExceeded` from
+  intermediate hops (issue #1). Consequences for future edits:
+  - The Windows `Prober` struct has different fields from the Unix
+    one (no `inflight`/`nextSeq` — `IcmpSendEcho2Ex` blocks until
+    reply or timeout, so the demux/aging logic isn't needed).
+  - Anything that touches `Prober` internals (e.g. probe_test.go's
+    `TestPruneInflightLocked`) is build-tagged `!windows`. Shared
+    helpers (HopStat/Snapshot/Config, `lossTimeout`, `buildSnapshot`)
+    live in `probe.go`.
+  - `privcheck.RawICMP()` on Windows validates iphlpapi.dll +
+    procs, not token elevation. `dropline trace` therefore runs
+    from a non-elevated PowerShell.
 - **CGO is forbidden** (`CGO_ENABLED=0` is enforced for static
   binaries). Avoid libraries that need it. The TUI clipboard
   (`[c]opy json`) uses OSC 52 instead of a CGO-bound clipboard lib
@@ -81,7 +87,9 @@ make e2e            # loopback smoke; needs raw-ICMP privilege
 ```
 cmd/dropline/        CLI entry, subcommand dispatch
 cmd/e2e/             black-box loopback smoke (driven by `make e2e`)
-internal/probe/      ICMP TTL-walking prober (forward + reverse share this)
+internal/probe/      ICMP TTL-walking prober (forward + reverse share this).
+                     Unix: raw ICMP socket (probe_unix.go).
+                     Windows: iphlpapi.dll!IcmpSendEcho2Ex (probe_windows.go).
 internal/stream/     UDP loss test: Hub demuxer, Receiver, Sender
 internal/control/    TCP control channel + JSON message types
 internal/agg/        per-second bucket aggregator + suspect-hop correlator

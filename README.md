@@ -126,35 +126,13 @@ Kitty, WezTerm, and tmux with `set-clipboard on`. Legacy consoles
 reads "copied: N bytes" because the escape was emitted, but the
 clipboard is unchanged.
 
-## Windows: trace requires Administrator
+## Windows
 
-The client's forward path-trace opens a raw ICMPv4 socket, which
-on Windows requires an elevated process. `dropline trace` detects
-the missing privilege at startup and exits with a clear error
-rather than falling back to a degraded mode.
-
-`dropline serve` runs unprivileged on Windows; the server side
-only needs raw ICMP if you want to enable reverse trace.
-
-### Known issue: forward path-trace returns sparse hops on Windows
-
-Windows raw ICMP sockets reliably deliver `EchoReply` from the
-destination but **not** `TimeExceeded` from intermediate routers
-— a well-known limitation of the Win32 raw-socket API. As a
-result, `dropline trace`'s forward hop table on a Windows client
-typically shows the destination correctly but most intermediate
-hops as 100% loss, even when the network itself is healthy
-(Windows' built-in `tracert` uses the higher-level
-`IcmpSendEcho2Ex` API from `iphlpapi.dll` and is not affected).
-
-What still works on Windows: the UDP loss / jitter / kernel-drops
-stream test, and the server-driven **reverse trace** (server →
-client) when the server is on Linux. Loss numbers and correlation
-analysis are unaffected.
-
-If you need a complete forward path-trace, run `dropline trace`
-from a Linux client. A Windows-native prober using
-`IcmpSendEcho2Ex` is tracked in [issue #1](https://github.com/PStorgaard/dropline/issues/1).
+`dropline trace` on Windows runs unprivileged. The forward path
+trace uses `iphlpapi.dll!IcmpSendEcho2Ex` — the same API
+`tracert.exe` uses — so neither Administrator nor raw-socket
+capability is needed. `dropline serve` also runs unprivileged;
+the reverse-trace feature is available on the same terms.
 
 ### Windows service
 
