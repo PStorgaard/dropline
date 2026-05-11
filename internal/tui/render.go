@@ -148,8 +148,15 @@ func renderHopTable(hops []agg.HopView, width int) string {
 	}
 	ladder := ladderFor(width)
 	headers := hopHeaders(ladder, "IP")
-	rows := make([][]string, 0, len(hops))
-	for i, h := range hops {
+	items := collapseSilentRuns(len(hops), func(i int) bool { return hops[i].IP == "" })
+	rows := make([][]string, 0, len(items))
+	for _, it := range items {
+		if it.runEnd >= 0 {
+			rows = append(rows, silentSummaryRow(ladder, hops[it.runStart].TTL, hops[it.runEnd].TTL, hops[it.runStart].Sent))
+			continue
+		}
+		i := it.single
+		h := hops[i]
 		silent := h.IP == ""
 		ttl := fmt.Sprintf("%d", h.TTL)
 		// Silent hops carry no actionable loss/RTT evidence; the correlator
@@ -212,8 +219,14 @@ func renderReverseHopTable(hops []agg.ReverseHopView, status string, width int) 
 	}
 	ladder := ladderFor(width)
 	headers := hopHeaders(ladder, "Addr")
-	rows := make([][]string, 0, len(hops))
-	for _, h := range hops {
+	items := collapseSilentRuns(len(hops), func(i int) bool { return hops[i].Addr == "" })
+	rows := make([][]string, 0, len(items))
+	for _, it := range items {
+		if it.runEnd >= 0 {
+			rows = append(rows, silentSummaryRow(ladder, hops[it.runStart].TTL, hops[it.runEnd].TTL, hops[it.runStart].Sent))
+			continue
+		}
+		h := hops[it.single]
 		silent := h.Addr == ""
 		addr := h.Addr
 		if silent {
@@ -289,6 +302,57 @@ func dimRow(cells []string) []string {
 		out[i] = dimStyle.Render(c)
 	}
 	return out
+}
+
+// hopItem is one entry in the rendered hop sequence. A run carries
+// runStart/runEnd as inclusive indices into the source hops slice
+// (runEnd-runStart+1 >= 2, all entries silent) and a -1 single. A
+// non-run entry carries single as the hop index and -1 for both run
+// fields.
+type hopItem struct {
+	runStart int
+	runEnd   int
+	single   int
+}
+
+// collapseSilentRuns folds contiguous runs of silent hops (≥2) into a
+// single summary item; everything else passes through as a single
+// item. Caller provides len(hops) and a silent-predicate so the helper
+// stays agnostic to the forward/reverse HopView shape.
+func collapseSilentRuns(n int, isSilent func(int) bool) []hopItem {
+	items := make([]hopItem, 0, n)
+	for i := 0; i < n; {
+		if isSilent(i) {
+			j := i + 1
+			for j < n && isSilent(j) {
+				j++
+			}
+			if j-i >= 2 {
+				items = append(items, hopItem{runStart: i, runEnd: j - 1, single: -1})
+				i = j
+				continue
+			}
+		}
+		items = append(items, hopItem{runStart: -1, runEnd: -1, single: i})
+		i++
+	}
+	return items
+}
+
+// silentSummaryRow builds the single collapsed row that stands in for
+// a run of silent hops. Sent is the representative per-hop probe count
+// (all members of a silent run share the same Sent value since the
+// prober TTL-walks them in parallel).
+func silentSummaryRow(l columnLadder, startTTL, endTTL int, sent int64) []string {
+	ttl := fmt.Sprintf("%d–%d", startTTL, endTTL)
+	label := dimStyle.Render(fmt.Sprintf("⋯ %d silent hops", endTTL-startTTL+1))
+	dash := dimStyle.Render("—")
+	row := hopRow(l,
+		ttl, label,
+		fmt.Sprintf("%d", sent),
+		dash, dash, dash, dash, dash,
+	)
+	return dimRow(row)
 }
 
 // hopHeaders returns the header slice for the chosen ladder rung.

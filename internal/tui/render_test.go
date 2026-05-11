@@ -642,6 +642,179 @@ func TestFooterIncludesHelpHint(t *testing.T) {
 	}
 }
 
+// collapseSilentRuns folds runs of ≥2 contiguous silent hops; singletons
+// (silent or not) pass through unchanged.
+func TestCollapseSilentRuns(t *testing.T) {
+	cases := []struct {
+		name   string
+		silent []bool
+		want   []hopItem
+	}{
+		{
+			name:   "no_silent",
+			silent: []bool{false, false, false},
+			want: []hopItem{
+				{runStart: -1, runEnd: -1, single: 0},
+				{runStart: -1, runEnd: -1, single: 1},
+				{runStart: -1, runEnd: -1, single: 2},
+			},
+		},
+		{
+			name:   "single_silent_passthrough",
+			silent: []bool{false, true, false},
+			want: []hopItem{
+				{runStart: -1, runEnd: -1, single: 0},
+				{runStart: -1, runEnd: -1, single: 1},
+				{runStart: -1, runEnd: -1, single: 2},
+			},
+		},
+		{
+			name:   "trailing_run",
+			silent: []bool{false, false, true, true, true},
+			want: []hopItem{
+				{runStart: -1, runEnd: -1, single: 0},
+				{runStart: -1, runEnd: -1, single: 1},
+				{runStart: 2, runEnd: 4, single: -1},
+			},
+		},
+		{
+			name:   "leading_run_then_responsive",
+			silent: []bool{true, true, true, false},
+			want: []hopItem{
+				{runStart: 0, runEnd: 2, single: -1},
+				{runStart: -1, runEnd: -1, single: 3},
+			},
+		},
+		{
+			name:   "all_silent",
+			silent: []bool{true, true, true, true},
+			want: []hopItem{
+				{runStart: 0, runEnd: 3, single: -1},
+			},
+		},
+		{
+			name:   "two_silent_run_at_min_threshold",
+			silent: []bool{false, true, true, false},
+			want: []hopItem{
+				{runStart: -1, runEnd: -1, single: 0},
+				{runStart: 1, runEnd: 2, single: -1},
+				{runStart: -1, runEnd: -1, single: 3},
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := collapseSilentRuns(len(c.silent), func(i int) bool { return c.silent[i] })
+			if len(got) != len(c.want) {
+				t.Fatalf("len = %d, want %d (got=%v)", len(got), len(c.want), got)
+			}
+			for i := range got {
+				if got[i] != c.want[i] {
+					t.Errorf("item[%d] = %+v, want %+v", i, got[i], c.want[i])
+				}
+			}
+		})
+	}
+}
+
+// Forward hop table collapses a trailing run of silent hops into a
+// single summary row, leaves responsive hops intact, and never folds a
+// single isolated silent hop.
+func TestRenderHopTableCollapsesSilentRun(t *testing.T) {
+	hops := []agg.HopView{
+		{TTL: 1, IP: "10.0.0.1", Sent: 8, Recv: 8, LastRTTMS: 1, AvgRTTMS: 1, BestRTTMS: 1, WorstRTTMS: 1},
+		{TTL: 2, IP: "10.0.0.2", Sent: 8, Recv: 8, LastRTTMS: 2, AvgRTTMS: 2, BestRTTMS: 2, WorstRTTMS: 2},
+		{TTL: 3, IP: "", Sent: 8},
+		{TTL: 4, IP: "", Sent: 8},
+		{TTL: 5, IP: "", Sent: 8},
+		{TTL: 6, IP: "10.0.0.6", Sent: 8, Recv: 8, LastRTTMS: 6, AvgRTTMS: 6, BestRTTMS: 6, WorstRTTMS: 6},
+	}
+	got := stripANSI(renderHopTable(hops, 120))
+	if !strings.Contains(got, "3–5") {
+		t.Errorf("expected TTL range 3–5 in collapsed row; got\n%s", got)
+	}
+	if !strings.Contains(got, "⋯ 3 silent hops") {
+		t.Errorf("expected '⋯ 3 silent hops' label; got\n%s", got)
+	}
+	// Endpoints must still render normally.
+	if !strings.Contains(got, "10.0.0.1") || !strings.Contains(got, "10.0.0.6") {
+		t.Errorf("responsive hops missing; got\n%s", got)
+	}
+	// No standalone "3" / "4" / "5" TTL row remains. Each line in the
+	// table body that's not the collapsed row should not be a silent
+	// row for those TTLs.
+	for _, ttl := range []string{" 3 ", " 4 ", " 5 "} {
+		// Allow occurrences as part of the range "3–5"; check standalone.
+		if strings.Contains(got, ttl+" *") {
+			t.Errorf("expected silent TTL row %q to be collapsed; got\n%s", ttl, got)
+		}
+	}
+}
+
+// A single silent hop sandwiched between responsive hops is NOT
+// collapsed — the row stays in place.
+func TestRenderHopTableDoesNotCollapseSingleSilent(t *testing.T) {
+	hops := []agg.HopView{
+		{TTL: 1, IP: "10.0.0.1", Sent: 8, Recv: 8},
+		{TTL: 2, IP: "", Sent: 8},
+		{TTL: 3, IP: "10.0.0.3", Sent: 8, Recv: 8},
+	}
+	got := stripANSI(renderHopTable(hops, 120))
+	if strings.Contains(got, "silent hops") {
+		t.Errorf("single silent hop should not produce summary row; got\n%s", got)
+	}
+	// The bare "*" silent row should still be there.
+	if !strings.Contains(got, "*") {
+		t.Errorf("expected '*' for the single silent hop; got\n%s", got)
+	}
+}
+
+// Reverse path leading silent run collapses to a single summary row,
+// AND the existing leadingFilteredHint still renders above the table
+// (it draws from the original hops slice).
+func TestRenderReverseHopTableCollapsesLeadingRun(t *testing.T) {
+	hops := []agg.ReverseHopView{
+		{TTL: 1, Addr: "", Sent: 17},
+		{TTL: 2, Addr: "", Sent: 17},
+		{TTL: 3, Addr: "", Sent: 17},
+		{TTL: 4, Addr: "13.106.210.176", Sent: 17, Recv: 17, RTTMS: 20, AvgRTTMS: 20, BestRTTMS: 19, WorstRTTMS: 22},
+	}
+	got := stripANSI(renderReverseHopTable(hops, "ok", 120))
+	if !strings.Contains(got, "TTLs 1–3 silent") {
+		t.Errorf("expected leading-filtered hint to remain; got\n%s", got)
+	}
+	if !strings.Contains(got, "1–3") {
+		t.Errorf("expected TTL range 1–3 in collapsed row; got\n%s", got)
+	}
+	if !strings.Contains(got, "⋯ 3 silent hops") {
+		t.Errorf("expected '⋯ 3 silent hops' label; got\n%s", got)
+	}
+	if !strings.Contains(got, "13.106.210.176") {
+		t.Errorf("responsive reverse hop missing; got\n%s", got)
+	}
+}
+
+// All-silent collapses into a single summary row.
+func TestRenderHopTableAllSilentCollapses(t *testing.T) {
+	hops := []agg.HopView{
+		{TTL: 1, IP: "", Sent: 5},
+		{TTL: 2, IP: "", Sent: 5},
+		{TTL: 3, IP: "", Sent: 5},
+	}
+	got := stripANSI(renderHopTable(hops, 120))
+	if !strings.Contains(got, "1–3") {
+		t.Errorf("expected TTL range 1–3; got\n%s", got)
+	}
+	if !strings.Contains(got, "⋯ 3 silent hops") {
+		t.Errorf("expected '⋯ 3 silent hops' label; got\n%s", got)
+	}
+	// Should be exactly one row in the table body (plus header line).
+	// Count lines containing the silent label.
+	if n := strings.Count(got, "silent hops"); n != 1 {
+		t.Errorf("expected exactly one collapsed row; got %d in\n%s", n, got)
+	}
+}
+
 func TestRenderHopTableColumnsByWidth(t *testing.T) {
 	hops := []agg.HopView{
 		{TTL: 1, IP: "10.0.0.1", Sent: 10, Recv: 10, LastRTTMS: 0.4, AvgRTTMS: 0.4, BestRTTMS: 0.3, WorstRTTMS: 0.6},
