@@ -283,6 +283,83 @@ func TestHubDoubleRegisterPanics(t *testing.T) {
 	_ = hub.Register(flow, DefaultRingSize)
 }
 
+// TestHubFlowRemoteAddrBlocksUntilFirstPacket asserts the contract the
+// server's reverse-direction Sender relies on: RemoteAddr(ctx) blocks
+// until the first packet for this flow arrives on the hub, then returns
+// the peer's UDP address. A second call returns immediately with the
+// same value.
+func TestHubFlowRemoteAddrBlocksUntilFirstPacket(t *testing.T) {
+	rconn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP: %v", err)
+	}
+	defer func() { _ = rconn.Close() }()
+	addr := rconn.LocalAddr().(*net.UDPAddr)
+
+	hub := NewHub(rconn)
+	hubCtx, hubCancel := context.WithCancel(context.Background())
+	defer hubCancel()
+	go func() { _ = hub.Run(hubCtx) }()
+
+	const flow uint32 = 0xCAFEBABE
+	flowHandle := hub.Register(flow, DefaultRingSize)
+	defer flowHandle.Release()
+
+	// Pre-packet: a short-timeout RemoteAddr should fail with DeadlineExceeded.
+	earlyCtx, earlyCancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer earlyCancel()
+	if got, err := flowHandle.RemoteAddr(earlyCtx); err == nil {
+		t.Fatalf("RemoteAddr before first packet should fail; got %v", got)
+	}
+
+	// Send one packet and then RemoteAddr must resolve.
+	sconn, err := net.DialUDP("udp4", nil, addr)
+	if err != nil {
+		t.Fatalf("DialUDP: %v", err)
+	}
+	defer func() { _ = sconn.Close() }()
+	const packetSize = HeaderSize + 32
+	sender, err := NewSender(sconn, SenderConfig{
+		RateBPS:    int64(packetSize * 8 * 100),
+		PacketSize: packetSize,
+		Duration:   50 * time.Millisecond,
+		FlowID:     flow,
+	})
+	if err != nil {
+		t.Fatalf("NewSender: %v", err)
+	}
+	sendCtx, sendCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer sendCancel()
+	go func() { _ = sender.Run(sendCtx) }()
+
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), time.Second)
+	defer waitCancel()
+	got, err := flowHandle.RemoteAddr(waitCtx)
+	if err != nil {
+		t.Fatalf("RemoteAddr after send: %v", err)
+	}
+	if got == nil {
+		t.Fatal("RemoteAddr returned nil addr")
+	}
+	if !got.IP.IsLoopback() {
+		t.Errorf("RemoteAddr.IP = %v, want loopback", got.IP)
+	}
+	if got.Port == 0 {
+		t.Errorf("RemoteAddr.Port = 0, want sender ephemeral port")
+	}
+
+	// Second call must return the same value without blocking.
+	immediateCtx, immediateCancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer immediateCancel()
+	again, err := flowHandle.RemoteAddr(immediateCtx)
+	if err != nil {
+		t.Fatalf("second RemoteAddr: %v", err)
+	}
+	if again.String() != got.String() {
+		t.Errorf("second RemoteAddr = %s, want %s", again, got)
+	}
+}
+
 // TestHubReleaseDuringActiveSend exercises the lookup→send window in
 // Hub.Run against a concurrent Release. Pre-fix the hub would close the
 // channel between RUnlock and the channel send, panicking "send on
