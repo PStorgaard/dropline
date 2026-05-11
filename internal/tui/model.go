@@ -230,6 +230,9 @@ func (m model) View() tea.View {
 	if rev := renderReverseKPI(m.latest.ReverseStream, m.width); rev != "" {
 		parts = append(parts, rev)
 	}
+	if tcp := renderTCPCorroborateKPI(m.latest.TCPCorroborate, m.width); tcp != "" {
+		parts = append(parts, tcp)
+	}
 	if m.width >= 30 {
 		if chart := renderSparkline(m.latest.Buckets, m.width); chart != "" {
 			parts = append(parts, chart)

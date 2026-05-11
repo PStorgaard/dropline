@@ -46,6 +46,11 @@ type Aggregator struct {
 	// once set, the snapshotLocked builder publishes a StreamView pointer
 	// into every emitted StateSnapshot.
 	lastReverse *stream.Snapshot
+	// lastTCPInfo is the most recent TCP_INFO sample from the
+	// corroboration probe. nil before the first ingest; once set,
+	// snapshotLocked publishes a TCPCorroborateView pointer in every
+	// emitted StateSnapshot.
+	lastTCPInfo *TCPCorroborateView
 }
 
 // New constructs an Aggregator. t0 is informational only this slice — it
@@ -129,6 +134,30 @@ func (a *Aggregator) IngestReverseStream(s stream.Snapshot) {
 	a.mu.Lock()
 	snap := s
 	a.lastReverse = &snap
+	state := a.snapshotLocked(a.lastTLocked(), a.lastView)
+	a.mu.Unlock()
+	a.emit(state)
+}
+
+// IngestTCPInfo records one TCP_INFO sample from the corroboration
+// probe. bytesRetrans / bytesOut are cumulative since the connection
+// was opened; the aggregator publishes them as-is plus a precomputed
+// retransmit fraction so renderers can branch on a single value.
+//
+// Sends are non-blocking — see IngestStream.
+func (a *Aggregator) IngestTCPInfo(bytesRetrans, bytesOut uint64, rttUs, minRttUs uint32) {
+	a.mu.Lock()
+	var pct float64
+	if bytesOut > 0 {
+		pct = float64(bytesRetrans) / float64(bytesOut) * 100
+	}
+	a.lastTCPInfo = &TCPCorroborateView{
+		BytesRetrans: bytesRetrans,
+		BytesOut:     bytesOut,
+		RetransPct:   pct,
+		RttUs:        rttUs,
+		MinRttUs:     minRttUs,
+	}
 	state := a.snapshotLocked(a.lastTLocked(), a.lastView)
 	a.mu.Unlock()
 	a.emit(state)
@@ -351,6 +380,11 @@ func (a *Aggregator) snapshotLocked(t float64, stream StreamView) StateSnapshot 
 		v := streamView(*a.lastReverse)
 		reverseStream = &v
 	}
+	var tcpInfo *TCPCorroborateView
+	if a.lastTCPInfo != nil {
+		v := *a.lastTCPInfo
+		tcpInfo = &v
+	}
 	return StateSnapshot{
 		T:                 t,
 		Stream:            stream,
@@ -359,6 +393,7 @@ func (a *Aggregator) snapshotLocked(t float64, stream StreamView) StateSnapshot 
 		LatestReverseHops: reverseCopy,
 		ReversePathStatus: a.reverseStatus,
 		ReverseStream:     reverseStream,
+		TCPCorroborate:    tcpInfo,
 	}
 }
 

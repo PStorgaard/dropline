@@ -61,6 +61,31 @@ make e2e            # loopback smoke; on Linux needs raw-ICMP
   already exist (see "CI / releases" below). The Makefile is the
   single source of truth for cross-compile + checksums; both
   workflows just call `make all` / `make e2e`.
+- **Server-side reverse Sender writes from the listening socket.**
+  `stream.SenderConfig.WriteTarget` flips the Sender's inner write
+  call from `conn.Write` (connected, e.g. `DialUDP`) to
+  `conn.WriteToUDP(buf, target)` (listening, e.g. `ListenUDP`).
+  The Hub exposes its conn via `Hub.Conn()` so the per-session
+  reverse Sender shares the single listening socket — which is
+  also the only path back through a NATted client's pinhole.
+  Don't mix the two: `WriteTarget != nil` + a connected conn
+  returns EISCONN; `WriteTarget == nil` + a listening conn
+  returns EDESTADDRREQ. The Sender constructor doesn't currently
+  enforce this — the recipe is in `cmd/dropline/serve.go` only.
+- **Reverse stream survives only as long as the NAT pinhole.**
+  Reverse-direction UDP rides the NAT mapping the client's
+  forward stream established. If the path traverses a NAT with a
+  short idle timeout (<60s) and the test pauses longer than
+  that, the mapping evicts and reverse packets bounce. Pause
+  intentionally doesn't extend test duration, so the worst case
+  is bounded. No code-level workaround in v1.
+- **TCP_INFO sampler degrades silently on old Windows.** The
+  Windows `internal/tcpinfo/` path calls `WSAIoctl SIO_TCP_INFO`
+  with `TCP_INFO_v0`. Pre-Win10-1703 returns `WSAEINVAL`; the
+  sampler latches into a "disabled" state and returns zero
+  stats with nil error for the rest of the session. The wire
+  shape stays the same (`tcp_corroborate` section present with
+  zeros), so renderers don't branch.
 
 ## CI / releases
 

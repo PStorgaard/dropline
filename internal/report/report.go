@@ -46,6 +46,22 @@ type Data struct {
 	// is the server's exact counter carried in Final.ReverseSent, while
 	// the receive/loss/jitter counters are the client's local view.
 	ReverseStream *ReverseStreamReport
+	// TCPCorroborate summarizes TCP retransmit activity on the dedicated
+	// corroboration probe socket. nil when tcp-corroborate was disabled
+	// or when the local platform's TCP_INFO sampler is a nop. Used to
+	// answer "is the observed UDP loss path-wide, or UDP-specific?".
+	TCPCorroborate *TCPCorroborateReport
+}
+
+// TCPCorroborateReport mirrors agg.TCPCorroborateView in the renderer's
+// type space. All four byte/microsecond counters are kernel-cumulative
+// on the probe socket; RetransPct is precomputed for the renderer.
+type TCPCorroborateReport struct {
+	BytesRetrans uint64  `json:"bytes_retrans"`
+	BytesOut     uint64  `json:"bytes_out"`
+	RetransPct   float64 `json:"retrans_pct"`
+	RttUs        uint32  `json:"rtt_us"`
+	MinRttUs     uint32  `json:"min_rtt_us"`
 }
 
 // ReverseStreamReport is the report-layer view of the reverse-direction

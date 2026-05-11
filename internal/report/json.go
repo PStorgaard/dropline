@@ -23,10 +23,11 @@ type jsonDoc struct {
 	Hops              []jsonHop            `json:"hops"`
 	ReversePath       []jsonReverseHop     `json:"reverse_path"`
 	ReversePathStatus string               `json:"reverse_path_status"`
-	Stream            jsonStream           `json:"stream"`
-	ReverseStream     *ReverseStreamReport `json:"reverse_stream,omitempty"`
-	Correlation       jsonCorrelation      `json:"correlation"`
-	Timeline          []jsonTimelineRow    `json:"timeline"`
+	Stream            jsonStream            `json:"stream"`
+	ReverseStream     *ReverseStreamReport  `json:"reverse_stream,omitempty"`
+	TCPCorroborate    *TCPCorroborateReport `json:"tcp_corroborate,omitempty"`
+	Correlation       jsonCorrelation       `json:"correlation"`
+	Timeline          []jsonTimelineRow     `json:"timeline"`
 }
 
 // jsonReverseHop mirrors jsonHop's shape — same `rtt_ms` struct, same
@@ -139,9 +140,10 @@ func RenderJSON(w io.Writer, d Data) error {
 			RateTxBPS: d.Stream.RateTxBPS,
 			RateRxBPS: d.Stream.RateRxBPS,
 		},
-		ReverseStream: d.ReverseStream,
-		Correlation:   jsonCorrelation{SuspectHops: suspectHopsToJSON(d.Correlation)},
-		Timeline:      make([]jsonTimelineRow, 0, len(d.Timeline)),
+		ReverseStream:  d.ReverseStream,
+		TCPCorroborate: d.TCPCorroborate,
+		Correlation:    jsonCorrelation{SuspectHops: suspectHopsToJSON(d.Correlation)},
+		Timeline:       make([]jsonTimelineRow, 0, len(d.Timeline)),
 	}
 	for _, b := range d.Timeline {
 		doc.Timeline = append(doc.Timeline, jsonTimelineRow{

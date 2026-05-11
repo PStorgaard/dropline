@@ -212,6 +212,11 @@ type traceJSON struct {
 		LossPct   float64 `json:"loss_pct"`
 		DurationS float64 `json:"duration_s"`
 	} `json:"reverse_stream,omitempty"`
+	TCPCorroborate *struct {
+		BytesRetrans uint64  `json:"bytes_retrans"`
+		BytesOut     uint64  `json:"bytes_out"`
+		RetransPct   float64 `json:"retrans_pct"`
+	} `json:"tcp_corroborate,omitempty"`
 }
 
 func assertHealthy(d traceJSON) error {
@@ -276,5 +281,18 @@ func assertHealthy(d traceJSON) error {
 	if d.ReverseStream.LossPct >= 1.0 {
 		return fmt.Errorf("reverse_stream.loss_pct = %.3f, want < 1.0 on loopback", d.ReverseStream.LossPct)
 	}
+	// tcp_corroborate is the dedicated TCP retransmit probe section.
+	// On the default auto/auto matrix it should be present. BytesOut
+	// > 0 confirms the client wrote bytes and the local TCP_INFO
+	// sampler returned a non-zero counter. On platforms whose sampler
+	// is a no-op (macOS for v1) BytesOut will be zero and we tolerate
+	// that — the section's presence is enough to assert the wiring.
+	if d.TCPCorroborate == nil {
+		return errors.New("tcp_corroborate section missing (auto resolution should enable it)")
+	}
+	// Don't assert on RetransPct — loopback may produce zero retransmits
+	// reliably or pathologically depending on TCP stack tuning. The
+	// signal we care about for the e2e is "the wiring is intact"; the
+	// retransmit value's correctness is covered by tcpinfo unit tests.
 	return nil
 }

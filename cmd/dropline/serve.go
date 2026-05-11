@@ -159,6 +159,7 @@ func handleSession(ctx context.Context, c *control.Conn, hello *control.Hello, h
 
 	reverseDecision := resolveReverseTrace(hello.ReverseTrace, reverseCapable)
 	reverseStreamDecision, reverseStreamFlowID := resolveReverseStream(hello.ReverseStream, hello.ReverseFlowID, hello.FlowID)
+	tcpCorroborateDecision := resolveTCPCorroborate(hello.TCPCorroborate)
 
 	// Register the flow_id BEFORE sending Ready so a collision produces a
 	// terminal Error rather than a Ready-then-Error sequence. The Hub's
@@ -171,11 +172,12 @@ func handleSession(ctx context.Context, c *control.Conn, hello *control.Hello, h
 	defer flowHandle.Release()
 
 	if err := c.Send(&control.Ready{
-		Type:          control.TypeReady,
-		SessionID:     sid,
-		ReverseTrace:  reverseDecision,
-		ReverseStream: reverseStreamDecision,
-		ReverseFlowID: reverseStreamFlowID,
+		Type:           control.TypeReady,
+		SessionID:      sid,
+		ReverseTrace:   reverseDecision,
+		ReverseStream:  reverseStreamDecision,
+		ReverseFlowID:  reverseStreamFlowID,
+		TCPCorroborate: tcpCorroborateDecision,
 	}); err != nil {
 		return err
 	}
@@ -287,6 +289,19 @@ func handleSession(ctx context.Context, c *control.Conn, hello *control.Hello, h
 
 	final := buildFinal(hello, finalSnap, &reverseStreamSent, &reverseStreamDurationS)
 	return c.Send(&final)
+}
+
+// resolveTCPCorroborate is the server's accept/reject decision for the
+// client's --tcp-corroborate preference. Today the server accepts probe
+// connections unconditionally (the handler is wired in serveRun), so
+// the resolution is trivial — anything other than the explicit "off"
+// resolves to "on". Kept as a function so future server-side gating
+// (e.g. a flag to disable the probe handler) lands here.
+func resolveTCPCorroborate(clientPref string) string {
+	if clientPref == "off" {
+		return "off"
+	}
+	return "on"
 }
 
 // resolveReverseStream picks the server's reverse-UDP-stream decision.

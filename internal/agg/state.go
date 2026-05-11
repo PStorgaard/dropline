@@ -34,6 +34,24 @@ type StateSnapshot struct {
 	// for this session. Nil otherwise. Renderers branch on nil to decide
 	// whether to render the reverse-stream KPI / section.
 	ReverseStream *StreamView
+	// TCPCorroborate is the most recent TCP retransmit / RTT sample
+	// from the dedicated corroboration probe socket. Nil until the
+	// first sample arrives (or for the entire test when the probe is
+	// disabled). Renderers branch on nil to decide whether to render
+	// the section.
+	TCPCorroborate *TCPCorroborateView
+}
+
+// TCPCorroborateView mirrors tcpinfo.Stats in the renderer's type
+// space so internal/tui and internal/report don't import internal/tcpinfo.
+// RetransPct is precomputed for the renderer: BytesRetrans / BytesOut
+// * 100, or 0 when BytesOut is zero.
+type TCPCorroborateView struct {
+	BytesRetrans uint64
+	BytesOut     uint64
+	RetransPct   float64
+	RttUs        uint32
+	MinRttUs     uint32
 }
 
 // ReverseHopView is the immutable per-hop view of the server's reverse

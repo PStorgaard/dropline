@@ -26,6 +26,7 @@ import (
 	"github.com/PStorgaard/dropline/internal/probe"
 	"github.com/PStorgaard/dropline/internal/report"
 	"github.com/PStorgaard/dropline/internal/stream"
+	"github.com/PStorgaard/dropline/internal/tcpinfo"
 	"github.com/PStorgaard/dropline/internal/tui"
 )
 
@@ -77,16 +78,18 @@ func (m reverseTraceMode) String() string {
 }
 
 type traceConfig struct {
-	target        string
-	rateBPS       uint64
-	duration      time.Duration
-	packetSize    int
-	mtrInterval   time.Duration
-	maxHops       int
-	output        outputMode
-	savePath      string
-	reverseTrace  reverseTraceMode
-	reverseStream reverseTraceMode
+	target              string
+	rateBPS             uint64
+	duration            time.Duration
+	packetSize          int
+	mtrInterval         time.Duration
+	maxHops             int
+	output              outputMode
+	savePath            string
+	reverseTrace        reverseTraceMode
+	reverseStream       reverseTraceMode
+	tcpCorroborate      reverseTraceMode
+	tcpCorroborateRate  uint64 // bps
 }
 
 func parseTraceArgs(args []string, stdoutIsTTY bool, errOut io.Writer) (traceConfig, error) {
@@ -104,6 +107,8 @@ func parseTraceArgs(args []string, stdoutIsTTY bool, errOut io.Writer) (traceCon
 	save := fs.String("save", "", "write final JSON report to FILE")
 	reverse := fs.String("reverse-trace", "auto", "reverse trace mode: on, off, or auto")
 	reverseStream := fs.String("reverse-stream", "auto", "reverse-direction UDP loss test: on, off, or auto")
+	tcpCorroborate := fs.String("tcp-corroborate", "auto", "TCP retransmit corroboration probe: on, off, or auto")
+	tcpCorroborateRate := fs.String("tcp-corroborate-rate", "100K", "TCP corroboration probe rate (bps; suffixes K/M/G accepted)")
 
 	// Stdlib flag.Parse stops at the first non-flag token, but the spec
 	// puts TARGET before flags (`dropline trace TARGET --rate ...`).
@@ -152,6 +157,14 @@ func parseTraceArgs(args []string, stdoutIsTTY bool, errOut io.Writer) (traceCon
 	if err != nil {
 		return traceConfig{}, err
 	}
+	tcpCorr, err := parseTCPCorroborate(*tcpCorroborate)
+	if err != nil {
+		return traceConfig{}, err
+	}
+	tcpCorrRate, err := parseRate(*tcpCorroborateRate)
+	if err != nil {
+		return traceConfig{}, fmt.Errorf("--tcp-corroborate-rate: %w", err)
+	}
 
 	if *packetSize < 32 {
 		return traceConfig{}, fmt.Errorf("--packet-size must be >= 32 (stream header is 32 bytes), got %d", *packetSize)
@@ -170,16 +183,18 @@ func parseTraceArgs(args []string, stdoutIsTTY bool, errOut io.Writer) (traceCon
 	}
 
 	return traceConfig{
-		target:        target,
-		rateBPS:       rateBPS,
-		duration:      *duration,
-		packetSize:    *packetSize,
-		mtrInterval:   *mtrInterval,
-		maxHops:       *maxHops,
-		output:        mode,
-		savePath:      *save,
-		reverseTrace:  rev,
-		reverseStream: revStream,
+		target:             target,
+		rateBPS:            rateBPS,
+		duration:           *duration,
+		packetSize:         *packetSize,
+		mtrInterval:        *mtrInterval,
+		maxHops:            *maxHops,
+		output:             mode,
+		savePath:           *save,
+		reverseTrace:       rev,
+		reverseStream:      revStream,
+		tcpCorroborate:     tcpCorr,
+		tcpCorroborateRate: tcpCorrRate,
 	}, nil
 }
 
@@ -283,6 +298,22 @@ func parseReverseStream(raw string) (reverseTraceMode, error) {
 	}
 }
 
+// parseTCPCorroborate mirrors parseReverseTrace for the --tcp-corroborate
+// flag. Same three-mode semantics (auto/on/off) — distinct function for a
+// distinct error message.
+func parseTCPCorroborate(raw string) (reverseTraceMode, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "auto":
+		return reverseAuto, nil
+	case "on":
+		return reverseOn, nil
+	case "off":
+		return reverseOff, nil
+	default:
+		return 0, fmt.Errorf("--tcp-corroborate must be on, off, or auto; got %q", raw)
+	}
+}
+
 func stdoutIsTTY() bool {
 	fi, err := os.Stdout.Stat()
 	if err != nil {
@@ -346,17 +377,19 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 		}
 	}
 	hello := &control.Hello{
-		Type:          control.TypeHello,
-		Version:       1,
-		Mode:          "loss",
-		RateBPS:       int64(cfg.rateBPS), // #nosec G115 -- bounded by --rate parser
-		DurationMS:    cfg.duration.Milliseconds(),
-		PacketSize:    cfg.packetSize,
-		FlowID:        flowID,
-		ReverseTrace:  cfg.reverseTrace.String(),
-		MTRIntervalMS: cfg.mtrInterval.Milliseconds(),
-		ReverseStream: cfg.reverseStream.String(),
-		ReverseFlowID: reverseFlowID,
+		Type:                  control.TypeHello,
+		Version:               1,
+		Mode:                  "loss",
+		RateBPS:               int64(cfg.rateBPS), // #nosec G115 -- bounded by --rate parser
+		DurationMS:            cfg.duration.Milliseconds(),
+		PacketSize:            cfg.packetSize,
+		FlowID:                flowID,
+		ReverseTrace:          cfg.reverseTrace.String(),
+		MTRIntervalMS:         cfg.mtrInterval.Milliseconds(),
+		ReverseStream:         cfg.reverseStream.String(),
+		ReverseFlowID:         reverseFlowID,
+		TCPCorroborate:        cfg.tcpCorroborate.String(),
+		TCPCorroborateRateBPS: int64(cfg.tcpCorroborateRate), // #nosec G115 -- bounded by parseRate
 	}
 	if err := cc.Send(hello); err != nil {
 		return fmt.Errorf("send hello: %w", err)
@@ -368,6 +401,8 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 	}
 	var reversePathStatus string
 	var reverseStreamOn bool
+	var tcpCorroborateOn bool
+	var sessionID string
 	switch m := first.(type) {
 	case *control.Ready:
 		reversePathStatus = resolveReversePathStatus(cfg.reverseTrace.String(), m.ReverseTrace)
@@ -379,6 +414,8 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 		if m.ReverseStream == "on" && m.ReverseFlowID == reverseFlowID && reverseFlowID != 0 {
 			reverseStreamOn = true
 		}
+		tcpCorroborateOn = (m.TCPCorroborate == "on")
+		sessionID = m.SessionID
 	case *control.Error:
 		return fmt.Errorf("server rejected session: %s", m.Reason)
 	default:
@@ -513,6 +550,19 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 		}()
 	}
 
+	// TCP retransmit corroboration: when the server agreed, open a
+	// second TCP connection to the dropline port, send the TCPProbe
+	// first message, then push dummy bytes at a low rate while
+	// sampling TCP_INFO on the local end. The server-side handler just
+	// reads and discards; the diagnostic signal lives entirely on the
+	// client side. On dial / send failure we log and skip — the rest
+	// of the test keeps running.
+	if tcpCorroborateOn && cfg.tcpCorroborateRate > 0 {
+		if err := startTCPCorroborateProbe(workerCtx, &workersWG, cfg, sessionID, aggregator); err != nil {
+			fmt.Fprintf(os.Stderr, "dropline trace: tcp-corroborate skipped: %s\n", err)
+		}
+	}
+
 	var (
 		final    *control.Final
 		serverEr string
@@ -555,6 +605,7 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 			ReversePathStatus: finalState.ReversePathStatus,
 			Correlation:       suspectsToReports(suspects),
 			ReverseStream:     reverseStreamReport(finalState.ReverseStream, &f.Stats),
+			TCPCorroborate:    tcpCorroborateReport(finalState.TCPCorroborate),
 		}
 	}
 
@@ -811,6 +862,98 @@ func hopsFromAgg(in []agg.HopView) []report.HopReport {
 	return out
 }
 
+// startTCPCorroborateProbe opens the dedicated TCP probe connection to
+// the dropline server port, sends the TCPProbe handshake, and spawns
+// (a) a low-rate writer that keeps the kernel busy enough to retransmit
+// when the path drops bytes, and (b) a 1Hz sampler that reads TCP_INFO
+// and forwards it to the aggregator. Both goroutines are bound to
+// workerCtx via the supplied WaitGroup so the trace driver's shutdown
+// path picks them up alongside the other workers.
+func startTCPCorroborateProbe(workerCtx context.Context, wg *sync.WaitGroup, cfg traceConfig, sessionID string, aggregator *agg.Aggregator) error {
+	tcpAddr, err := net.ResolveTCPAddr("tcp4", cfg.target)
+	if err != nil {
+		return fmt.Errorf("resolve tcp: %w", err)
+	}
+	probeConn, err := net.DialTCP("tcp4", nil, tcpAddr)
+	if err != nil {
+		return fmt.Errorf("dial tcp: %w", err)
+	}
+	if err := control.WriteMessage(probeConn, &control.TCPProbe{
+		Type:      control.TypeTCPProbe,
+		SessionID: sessionID,
+		RateBPS:   int64(cfg.tcpCorroborateRate), // #nosec G115 -- bounded by parseRate
+	}); err != nil {
+		_ = probeConn.Close()
+		return fmt.Errorf("send tcp_probe: %w", err)
+	}
+	sampler, err := tcpinfo.New(probeConn)
+	if err != nil {
+		_ = probeConn.Close()
+		return fmt.Errorf("init tcpinfo sampler: %w", err)
+	}
+
+	// Close the probe socket when workerCtx fires so the writer
+	// goroutine's blocking Write returns and the sampler goroutine
+	// exits cleanly via the ticker case.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-workerCtx.Done()
+		_ = probeConn.Close()
+	}()
+
+	// Writer: emit fixed-size chunks at a 10Hz cadence to hit the
+	// configured rate. The chunk size is chosen so even a 100kbps probe
+	// produces enough TCP segments (10 chunks/sec × ~1250 bytes ≈ a few
+	// MSS-sized segments) to be a meaningful retransmit canary.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		const ticksPerSec = 10
+		bytesPerTick := int(cfg.tcpCorroborateRate / 8 / ticksPerSec)
+		if bytesPerTick < 64 {
+			bytesPerTick = 64
+		}
+		buf := make([]byte, bytesPerTick)
+		tk := time.NewTicker(time.Second / ticksPerSec)
+		defer tk.Stop()
+		for {
+			select {
+			case <-workerCtx.Done():
+				return
+			case <-tk.C:
+				if _, err := probeConn.Write(buf); err != nil {
+					return
+				}
+			}
+		}
+	}()
+
+	// Sampler: poll TCP_INFO every second; push results to aggregator.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer func() { _ = sampler.Close() }()
+		tk := time.NewTicker(time.Second)
+		defer tk.Stop()
+		for {
+			select {
+			case <-workerCtx.Done():
+				return
+			case <-tk.C:
+				st, err := sampler.Sample()
+				if err != nil {
+					// Stop polling on first error — typically the
+					// socket has been closed mid-shutdown.
+					return
+				}
+				aggregator.IngestTCPInfo(st.BytesRetrans, st.BytesOut, st.RttUs, st.MinRttUs)
+			}
+		}
+	}()
+	return nil
+}
+
 // reverseStreamReport builds the renderer's reverse-stream view from the
 // aggregator's last-known reverse StreamView plus the server's reported
 // counters in Final.ReverseSent / Final.ReverseDurationS. Returns nil
@@ -834,6 +977,22 @@ func reverseStreamReport(v *agg.StreamView, fs *control.FinalStats) *report.Reve
 		out.JitterMS = v.JitterMS
 	}
 	return &out
+}
+
+// tcpCorroborateReport builds the renderer's TCP-corroborate view from
+// the aggregator's last-seen sample. Returns nil when the aggregator
+// never saw a sample (probe disabled, or sampler nop on this platform).
+func tcpCorroborateReport(v *agg.TCPCorroborateView) *report.TCPCorroborateReport {
+	if v == nil {
+		return nil
+	}
+	return &report.TCPCorroborateReport{
+		BytesRetrans: v.BytesRetrans,
+		BytesOut:     v.BytesOut,
+		RetransPct:   v.RetransPct,
+		RttUs:        v.RttUs,
+		MinRttUs:     v.MinRttUs,
+	}
 }
 
 // suspectsToReports adapts the agg correlator's output into the renderer's

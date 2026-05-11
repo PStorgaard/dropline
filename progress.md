@@ -13,6 +13,8 @@ Legend: `[x]` done · `[~]` partial / wired-but-incomplete · `[ ]` todo
 - [x] Cross-compile to linux-amd64, linux-arm64, windows-amd64 with SHA256SUMS
 - [x] First runnable `serve`: accepts one session, runs `stream.Receiver`, emits periodic `Stats` and a `Final` (single-session; multi-session via UDP demux is a follow-up)
 - [x] First end-to-end slice: `trace` against a `serve` peer — `--report`, `--json`, and `--tui` all run end-to-end; only `[p]ause` and `[c]opy json` keybindings remain in the TUI section (both blocked — see internal/tui)
+- [x] Reverse-direction UDP loss (`--reverse-stream auto|on|off`): server captures the client's UDP source addr on first packet via `HubFlow.RemoteAddr(ctx)`, runs a Sender against it from the listening socket using `SenderConfig.WriteTarget`; client adds a `stream.Receiver` on its dialed socket filtering by `reverseFlowID`; aggregator surfaces a `ReverseStream *StreamView`; renderers emit a `reverse_stream` JSON section + text subsection + a TUI KPI card. e2e asserts `recv > 0, loss_pct < 1.0`. Auto resolution mirrors `--reverse-trace`
+- [x] TCP retransmit corroboration (`--tcp-corroborate auto|on|off`, `--tcp-corroborate-rate`): dedicated TCP probe connection to the dropline port, dispatched via `control.Server.ProbeHandler` after the first `TCPProbe` message; client streams dummy bytes at the configured rate and samples TCP_INFO via a new `internal/tcpinfo/` package (Linux `getsockopt TCP_INFO`, Windows `WSAIoctl SIO_TCP_INFO v0`, nop on macOS); renderers emit a `tcp_corroborate` JSON section + text subsection + TUI KPI card. e2e asserts the section is present
 - [ ] Definition-of-done per spec § DoD
 
 ## Per-package

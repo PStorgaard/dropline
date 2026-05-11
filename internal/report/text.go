@@ -54,6 +54,16 @@ func RenderText(w io.Writer, d Data) error {
 	fmt.Fprintf(&sb, "  bursts:       %s\n",
 		agg.FormatBurstSummary(b.Ten99, b.HundredUp, b.Max))
 
+	if c := d.TCPCorroborate; c != nil {
+		sb.WriteString("\ntcp corroborate (probe socket):\n")
+		fmt.Fprintf(&sb, "  bytes out:    %d\n", c.BytesOut)
+		fmt.Fprintf(&sb, "  bytes retrans:%d (%.3f%%)\n", c.BytesRetrans, c.RetransPct)
+		if c.RttUs > 0 {
+			fmt.Fprintf(&sb, "  rtt:          %.2f ms (min %.2f ms)\n",
+				float64(c.RttUs)/1000.0, float64(c.MinRttUs)/1000.0)
+		}
+	}
+
 	if r := d.ReverseStream; r != nil {
 		sb.WriteString("\nreverse udp stream (server→client):\n")
 		fmt.Fprintf(&sb, "  sent (server):%d\n", r.Sent)
