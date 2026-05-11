@@ -12,18 +12,23 @@ v1 is IPv4-only and pure Go (`CGO_ENABLED=0`). Cross-compiles to
 
 ## Install
 
-**Pre-built binaries.** Build all three targets:
+**Pre-built binaries** ship from the
+[Releases page](https://github.com/PStorgaard/dropline/releases).
+Each release attaches `dropline-linux-amd64`, `dropline-linux-arm64`,
+`dropline-windows-amd64.exe`, and a `SHA256SUMS` file. On Linux:
+
+```bash
+curl -fsSLO https://github.com/PStorgaard/dropline/releases/latest/download/dropline-linux-amd64
+sudo install -m 0755 dropline-linux-amd64 /usr/local/bin/dropline
+dropline version
+```
+
+**Build locally.** Cross-compiles all three targets to `dist/`:
 
 ```bash
 make all
 # Produces dist/dropline-{linux-amd64,linux-arm64,windows-amd64.exe}
 # plus dist/SHA256SUMS.
-```
-
-Copy the appropriate binary onto the target host. On Linux:
-
-```bash
-sudo install -m 0755 dist/dropline-linux-amd64 /usr/local/bin/dropline
 ```
 
 **From source.**
@@ -241,3 +246,33 @@ Live feature checklist: [`progress.md`](progress.md).
 Out of scope for v1: IPv6, TCP throughput, paris-traceroute,
 iperf3 wire compatibility, web dashboard, Prometheus metrics,
 multi-target tracing.
+
+## Releases
+
+Pre-built binaries live on the
+[Releases page](https://github.com/PStorgaard/dropline/releases).
+Each download URL has the form
+`https://github.com/PStorgaard/dropline/releases/download/<TAG>/<ASSET>`
+— e.g. `.../download/v1.0.0/dropline-linux-amd64`. The
+`/latest/download/<ASSET>` alias resolves to the most recent
+non-prerelease tag. Every release also ships `SHA256SUMS`; verify
+with `sha256sum -c SHA256SUMS` on Linux.
+
+`dropline version` prints the tag the binary was built from (e.g.
+`v1.0.0`) — useful when triaging a host's installed version.
+
+### Cutting a release (maintainers)
+
+The `.github/workflows/release.yml` pipeline runs on any pushed tag
+matching `v*`. It cross-compiles, runs the loopback e2e smoke test
+as a release gate, and uploads the binaries + `SHA256SUMS` to a new
+GitHub Release with auto-generated notes.
+
+```bash
+git tag -a v1.0.0 -m 'v1.0.0'
+git push origin v1.0.0
+```
+
+If the e2e step fails the release is not published; delete the tag
+(`git push --delete origin v1.0.0`) once the underlying issue is
+fixed and re-tag.
