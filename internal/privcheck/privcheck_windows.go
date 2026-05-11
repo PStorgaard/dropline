@@ -11,11 +11,11 @@ import (
 // iphlpapi procs the prober relies on. Mirrors the eager-load
 // discipline in internal/stream/kerneldrops_windows.go.
 var (
-	iphlpapiDLL              = windows.NewLazySystemDLL("iphlpapi.dll")
-	procIcmpCreateFile       = iphlpapiDLL.NewProc("IcmpCreateFile")
-	procIcmpCloseHandle      = iphlpapiDLL.NewProc("IcmpCloseHandle")
-	procIcmpSendEcho2Ex      = iphlpapiDLL.NewProc("IcmpSendEcho2Ex")
-	requiredProcs            = []*windows.LazyProc{procIcmpCreateFile, procIcmpCloseHandle, procIcmpSendEcho2Ex}
+	iphlpapiDLL         = windows.NewLazySystemDLL("iphlpapi.dll")
+	procIcmpCreateFile  = iphlpapiDLL.NewProc("IcmpCreateFile")
+	procIcmpCloseHandle = iphlpapiDLL.NewProc("IcmpCloseHandle")
+	procIcmpSendEcho2Ex = iphlpapiDLL.NewProc("IcmpSendEcho2Ex")
+	requiredProcs       = []*windows.LazyProc{procIcmpCreateFile, procIcmpCloseHandle, procIcmpSendEcho2Ex}
 )
 
 // RawICMP reports whether this process can perform ICMP probing.

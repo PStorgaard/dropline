@@ -193,11 +193,11 @@ type traceJSON struct {
 	} `json:"correlation"`
 	ReversePathStatus string `json:"reverse_path_status"`
 	ReversePath       []struct {
-		TTL      int    `json:"ttl"`
-		Addr     string `json:"addr"`
-		Sent     int64  `json:"sent"`
-		Recv     int64  `json:"recv"`
-		RTTMS    struct {
+		TTL   int    `json:"ttl"`
+		Addr  string `json:"addr"`
+		Sent  int64  `json:"sent"`
+		Recv  int64  `json:"recv"`
+		RTTMS struct {
 			Last   float64 `json:"last"`
 			Best   float64 `json:"best"`
 			Worst  float64 `json:"worst"`

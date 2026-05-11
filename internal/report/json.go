@@ -15,14 +15,14 @@ import (
 // computed float instead of the raw int64 count carried in
 // control.FinalStats.
 type jsonDoc struct {
-	Version           int                  `json:"version"`
-	Target            string               `json:"target"`
-	StartedAt         string               `json:"started_at"`
-	DurationS         float64              `json:"duration_s"`
-	Config            Config               `json:"config"`
-	Hops              []jsonHop            `json:"hops"`
-	ReversePath       []jsonReverseHop     `json:"reverse_path"`
-	ReversePathStatus string               `json:"reverse_path_status"`
+	Version           int                   `json:"version"`
+	Target            string                `json:"target"`
+	StartedAt         string                `json:"started_at"`
+	DurationS         float64               `json:"duration_s"`
+	Config            Config                `json:"config"`
+	Hops              []jsonHop             `json:"hops"`
+	ReversePath       []jsonReverseHop      `json:"reverse_path"`
+	ReversePathStatus string                `json:"reverse_path_status"`
 	Stream            jsonStream            `json:"stream"`
 	ReverseStream     *ReverseStreamReport  `json:"reverse_stream,omitempty"`
 	TCPCorroborate    *TCPCorroborateReport `json:"tcp_corroborate,omitempty"`
@@ -66,16 +66,16 @@ type jsonRTT struct {
 }
 
 type jsonStream struct {
-	Sent        int64        `json:"sent"`
-	Recv        int64        `json:"recv"`
-	LossPct     float64      `json:"loss_pct"`
-	OutOfOrder  int64        `json:"out_of_order"`
-	Duplicates  int64        `json:"duplicates"`
-	JitterMS    float64      `json:"jitter_ms"`
-	KernelDrops int64        `json:"kernel_drops"`
-	Bursts      jsonBursts   `json:"bursts"`
-	RateTxBPS   int64        `json:"rate_tx_bps"`
-	RateRxBPS   int64        `json:"rate_rx_bps"`
+	Sent        int64      `json:"sent"`
+	Recv        int64      `json:"recv"`
+	LossPct     float64    `json:"loss_pct"`
+	OutOfOrder  int64      `json:"out_of_order"`
+	Duplicates  int64      `json:"duplicates"`
+	JitterMS    float64    `json:"jitter_ms"`
+	KernelDrops int64      `json:"kernel_drops"`
+	Bursts      jsonBursts `json:"bursts"`
+	RateTxBPS   int64      `json:"rate_tx_bps"`
+	RateRxBPS   int64      `json:"rate_rx_bps"`
 }
 
 // jsonBursts matches the spec example exactly: it folds the 10-99 and
@@ -210,11 +210,11 @@ func reverseHopsToJSON(src []ReverseHopReport) []jsonReverseHop {
 	out := make([]jsonReverseHop, len(src))
 	for i, h := range src {
 		out[i] = jsonReverseHop{
-			TTL:      h.TTL,
-			Addr:     h.Addr,
-			Sent:     h.Sent,
-			Recv:     h.Recv,
-			LossPct:  h.LossPct,
+			TTL:     h.TTL,
+			Addr:    h.Addr,
+			Sent:    h.Sent,
+			Recv:    h.Recv,
+			LossPct: h.LossPct,
 			RTTMS: jsonRTT{
 				Last:   h.RTTMS,
 				Best:   h.BestRTTMS,

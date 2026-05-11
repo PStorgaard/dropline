@@ -137,7 +137,11 @@ func startServer(t *testing.T, ctx context.Context, maxSessions int) (tcpAddr st
 	// Tests run unprivileged, so reverseCapable is false — exercises the
 	// "Ready.ReverseTrace=off" path and avoids opening a raw ICMP socket
 	// that the test environment can't grant.
-	srv := &control.Server{Handler: newServeHandler(hub, false, maxSessions)}
+	reg := newSessionRegistry()
+	srv := &control.Server{
+		Handler:      newServeHandler(hub, false, maxSessions, reg),
+		ProbeHandler: newProbeHandler(reg, maxSessions),
+	}
 	go func() { _ = srv.Serve(ctx, tcpLn) }()
 
 	teardown = func() {

@@ -142,12 +142,12 @@ func (r *Receiver) Run(ctx context.Context) (Snapshot, error) {
 	r.acc = NewAccumulator(t0)
 
 	var (
-		obsCh        <-chan observation
-		drainerErr   atomic.Value
-		drainerWG    sync.WaitGroup
-		statsCh      chan observation
-		statsWG      sync.WaitGroup
-		ownsStatsCh  bool
+		obsCh       <-chan observation
+		drainerErr  atomic.Value
+		drainerWG   sync.WaitGroup
+		statsCh     chan observation
+		statsWG     sync.WaitGroup
+		ownsStatsCh bool
 	)
 
 	switch {

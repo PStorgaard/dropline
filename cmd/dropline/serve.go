@@ -119,9 +119,10 @@ func serveRun(ctx context.Context, cfg serveConfig) error {
 		_ = hub.Run(ctx)
 	}()
 
+	reg := newSessionRegistry()
 	srv := &control.Server{
-		Handler:      newServeHandler(hub, rawICMP.OK, cfg.maxSessions),
-		ProbeHandler: handleTCPProbe,
+		Handler:      newServeHandler(hub, rawICMP.OK, cfg.maxSessions, reg),
+		ProbeHandler: newProbeHandler(reg, cfg.maxSessions),
 	}
 	err = srv.Serve(ctx, tcpLn)
 	<-hubDone
@@ -131,8 +132,10 @@ func serveRun(ctx context.Context, cfg serveConfig) error {
 // newServeHandler returns a control.Handler that admits up to
 // maxSessions concurrent sessions and rejects further attempts with
 // "server busy". reverseCapable threads server-side raw-ICMP capability
-// into each session's reverse-trace decision.
-func newServeHandler(hub *stream.Hub, reverseCapable bool, maxSessions int) control.Handler {
+// into each session's reverse-trace decision. The registry threads
+// session liveness to newProbeHandler so tcp_probe connections can be
+// gated by an active session.
+func newServeHandler(hub *stream.Hub, reverseCapable bool, maxSessions int, reg *sessionRegistry) control.Handler {
 	if maxSessions < 1 {
 		maxSessions = 1
 	}
@@ -144,11 +147,43 @@ func newServeHandler(hub *stream.Hub, reverseCapable bool, maxSessions int) cont
 		default:
 			return c.Send(&control.Error{Type: control.TypeError, Reason: "server busy: max sessions reached"})
 		}
-		return handleSession(ctx, c, hello, hub, reverseCapable)
+		return handleSession(ctx, c, hello, hub, reverseCapable, reg)
 	}
 }
 
-func handleSession(ctx context.Context, c *control.Conn, hello *control.Hello, hub *stream.Hub, reverseCapable bool) error {
+// sessionRegistry tracks the set of session IDs currently held by a
+// live handleSession goroutine. It exists so newProbeHandler can reject
+// tcp_probe connections that don't reference a real session — otherwise
+// any peer with TCP reachability can hold a probe fd open forever.
+type sessionRegistry struct {
+	mu  sync.Mutex
+	ids map[string]struct{}
+}
+
+func newSessionRegistry() *sessionRegistry {
+	return &sessionRegistry{ids: make(map[string]struct{})}
+}
+
+func (r *sessionRegistry) add(sid string) {
+	r.mu.Lock()
+	r.ids[sid] = struct{}{}
+	r.mu.Unlock()
+}
+
+func (r *sessionRegistry) remove(sid string) {
+	r.mu.Lock()
+	delete(r.ids, sid)
+	r.mu.Unlock()
+}
+
+func (r *sessionRegistry) has(sid string) bool {
+	r.mu.Lock()
+	_, ok := r.ids[sid]
+	r.mu.Unlock()
+	return ok
+}
+
+func handleSession(ctx context.Context, c *control.Conn, hello *control.Hello, hub *stream.Hub, reverseCapable bool, reg *sessionRegistry) error {
 	if reason := validateHello(hello); reason != "" {
 		return c.Send(&control.Error{Type: control.TypeError, Reason: reason})
 	}
@@ -156,6 +191,10 @@ func handleSession(ctx context.Context, c *control.Conn, hello *control.Hello, h
 	if err != nil {
 		return c.Send(&control.Error{Type: control.TypeError, Reason: "internal error: session id"})
 	}
+	// Publish the SID for the lifetime of this handler so a peer's
+	// tcp_probe connection can be matched against an active session.
+	reg.add(sid)
+	defer reg.remove(sid)
 
 	reverseDecision := resolveReverseTrace(hello.ReverseTrace, reverseCapable)
 	reverseStreamDecision, reverseStreamFlowID := resolveReverseStream(hello.ReverseStream, hello.ReverseFlowID, hello.FlowID)
@@ -569,26 +608,61 @@ func validateHello(h *control.Hello) string {
 // happens on the client side; the server has no diagnostic role here
 // beyond keeping the connection open so the kernel keeps transmitting.
 //
-// The function returns when the client closes the connection, when ctx
-// is canceled (server shutdown), or when the read returns a non-EOF
-// error. We don't bound the lifetime with hello.DurationMS — the
-// client controls its end of the conn and closes when done.
-func handleTCPProbe(ctx context.Context, nc net.Conn, probe *control.TCPProbe) {
-	// Close the conn on ctx done so a long-lived peer doesn't keep the
-	// goroutine alive past server shutdown.
-	doneCh := make(chan struct{})
-	defer close(doneCh)
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = nc.Close()
-		case <-doneCh:
-		}
-	}()
-	buf := make([]byte, 32<<10)
-	for {
-		if _, err := nc.Read(buf); err != nil {
+// Probe connections are gated three ways:
+//   - They must reference an active session_id (registered by
+//     handleSession). Bare reachability to the TCP port is not enough.
+//   - They take a slot on a per-server probe semaphore sized to
+//     maxProbes, so an attacker can't pin one goroutine + fd per probe
+//     beyond the configured concurrency.
+//   - Each read carries an idle deadline, and the connection has a
+//     hard lifetime ceiling, so a peer that opens a probe and stops
+//     sending bytes still gets evicted.
+const (
+	probeIdleTimeout = 30 * time.Second
+	probeMaxLifetime = 5 * time.Minute
+)
+
+func newProbeHandler(reg *sessionRegistry, maxProbes int) control.ProbeHandler {
+	if maxProbes < 1 {
+		maxProbes = 1
+	}
+	sem := make(chan struct{}, maxProbes)
+	return func(ctx context.Context, nc net.Conn, probe *control.TCPProbe) {
+		// Reject probes that don't match a live session before
+		// taking any slot or starting any goroutines.
+		if probe.SessionID == "" || !reg.has(probe.SessionID) {
+			_ = control.WriteMessage(nc, &control.Error{Type: control.TypeError, Reason: "tcp_probe: unknown or expired session_id"})
 			return
+		}
+		select {
+		case sem <- struct{}{}:
+			defer func() { <-sem }()
+		default:
+			_ = control.WriteMessage(nc, &control.Error{Type: control.TypeError, Reason: "tcp_probe: server busy"})
+			return
+		}
+
+		// Hard lifetime ceiling: even a well-behaved peer cannot pin
+		// the probe past probeMaxLifetime. The closer goroutine also
+		// handles server-shutdown via ctx cancellation.
+		probeCtx, cancel := context.WithTimeout(ctx, probeMaxLifetime)
+		defer cancel()
+		doneCh := make(chan struct{})
+		defer close(doneCh)
+		go func() {
+			select {
+			case <-probeCtx.Done():
+				_ = nc.Close()
+			case <-doneCh:
+			}
+		}()
+
+		buf := make([]byte, 32<<10)
+		for {
+			_ = nc.SetReadDeadline(time.Now().Add(probeIdleTimeout))
+			if _, err := nc.Read(buf); err != nil {
+				return
+			}
 		}
 	}
 }

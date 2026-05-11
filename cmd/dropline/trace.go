@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"os/signal"
@@ -78,18 +79,18 @@ func (m reverseTraceMode) String() string {
 }
 
 type traceConfig struct {
-	target              string
-	rateBPS             uint64
-	duration            time.Duration
-	packetSize          int
-	mtrInterval         time.Duration
-	maxHops             int
-	output              outputMode
-	savePath            string
-	reverseTrace        reverseTraceMode
-	reverseStream       reverseTraceMode
-	tcpCorroborate      reverseTraceMode
-	tcpCorroborateRate  uint64 // bps
+	target             string
+	rateBPS            int64
+	duration           time.Duration
+	packetSize         int
+	mtrInterval        time.Duration
+	maxHops            int
+	output             outputMode
+	savePath           string
+	reverseTrace       reverseTraceMode
+	reverseStream      reverseTraceMode
+	tcpCorroborate     reverseTraceMode
+	tcpCorroborateRate int64 // bps
 }
 
 func parseTraceArgs(args []string, stdoutIsTTY bool, errOut io.Writer) (traceConfig, error) {
@@ -213,7 +214,7 @@ func normalizeTarget(raw string) (string, error) {
 	return raw + ":" + defaultPort, nil
 }
 
-func parseRate(raw string) (uint64, error) {
+func parseRate(raw string) (int64, error) {
 	s := strings.TrimSpace(raw)
 	if s == "" {
 		return 0, errors.New("empty rate")
@@ -238,7 +239,12 @@ func parseRate(raw string) (uint64, error) {
 	if n == 0 {
 		return 0, errors.New("rate must be > 0")
 	}
-	return n * mult, nil
+	// Bound the product inside int64 so downstream RateBPS fields
+	// (int64) don't silently wrap to a negative value.
+	if n > uint64(math.MaxInt64)/mult {
+		return 0, fmt.Errorf("rate %q exceeds max supported rate", raw)
+	}
+	return int64(n * mult), nil
 }
 
 func pickOutputMode(tui, report, jsonOut, isTTY bool) (outputMode, error) {
@@ -380,7 +386,7 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 		Type:                  control.TypeHello,
 		Version:               1,
 		Mode:                  "loss",
-		RateBPS:               int64(cfg.rateBPS), // #nosec G115 -- bounded by --rate parser
+		RateBPS:               cfg.rateBPS,
 		DurationMS:            cfg.duration.Milliseconds(),
 		PacketSize:            cfg.packetSize,
 		FlowID:                flowID,
@@ -389,7 +395,7 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 		ReverseStream:         cfg.reverseStream.String(),
 		ReverseFlowID:         reverseFlowID,
 		TCPCorroborate:        cfg.tcpCorroborate.String(),
-		TCPCorroborateRateBPS: int64(cfg.tcpCorroborateRate), // #nosec G115 -- bounded by parseRate
+		TCPCorroborateRateBPS: cfg.tcpCorroborateRate,
 	}
 	if err := cc.Send(hello); err != nil {
 		return fmt.Errorf("send hello: %w", err)
@@ -455,7 +461,7 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 	pauseGate := stream.NewPauseGate(nil)
 
 	sender, err := stream.NewSender(udpConn, stream.SenderConfig{
-		RateBPS:    int64(cfg.rateBPS), // #nosec G115 -- bounded by --rate parser
+		RateBPS:    cfg.rateBPS,
 		PacketSize: cfg.packetSize,
 		Duration:   cfg.duration,
 		FlowID:     flowID,
@@ -592,7 +598,7 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 			StartedAt: startedAt,
 			DurationS: f.Stats.DurationS,
 			Config: report.Config{
-				RateBPS:       int64(cfg.rateBPS), // #nosec G115 -- bounded by --rate parser
+				RateBPS:       cfg.rateBPS,
 				PacketSize:    cfg.packetSize,
 				MTRIntervalMS: cfg.mtrInterval.Milliseconds(),
 				MaxHops:       cfg.maxHops,
@@ -656,7 +662,7 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 
 		if err := tui.Run(ctx, snaps, tui.Options{
 			Target:    cfg.target,
-			RateBPS:   int64(cfg.rateBPS), // #nosec G115 -- bounded by --rate parser
+			RateBPS:   cfg.rateBPS,
 			Duration:  cfg.duration,
 			StartedAt: startedAt,
 			ResetFn:   aggregator.Reset,
@@ -674,6 +680,15 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 		<-recvDone
 		workersWG.Wait()
 	} else {
+		// Mirror the TUI branch's closer: when workerCtx is cancelled
+		// (SIGINT/SIGTERM via signal.NotifyContext, or any early exit
+		// path that calls workerCancel), close cc so the blocked
+		// cc.Recv() inside runRecvLoop returns instead of waiting for
+		// the server's Final.
+		go func() {
+			<-workerCtx.Done()
+			_ = cc.Close()
+		}()
 		final, serverEr, recvErr = runRecvLoop(cc, aggregator)
 		// When the reverse-direction stream is active, the server emits
 		// packets right up until its session timer fires; some of those
@@ -881,7 +896,7 @@ func startTCPCorroborateProbe(workerCtx context.Context, wg *sync.WaitGroup, cfg
 	if err := control.WriteMessage(probeConn, &control.TCPProbe{
 		Type:      control.TypeTCPProbe,
 		SessionID: sessionID,
-		RateBPS:   int64(cfg.tcpCorroborateRate), // #nosec G115 -- bounded by parseRate
+		RateBPS:   cfg.tcpCorroborateRate,
 	}); err != nil {
 		_ = probeConn.Close()
 		return fmt.Errorf("send tcp_probe: %w", err)

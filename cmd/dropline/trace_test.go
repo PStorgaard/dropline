@@ -218,7 +218,7 @@ func TestParseTraceArgsOutputModesMutuallyExclusive(t *testing.T) {
 func TestParseRate(t *testing.T) {
 	cases := []struct {
 		in   string
-		want uint64
+		want int64
 		err  bool
 	}{
 		{"10M", 10_000_000, false},
@@ -230,6 +230,12 @@ func TestParseRate(t *testing.T) {
 		{"", 0, true},
 		{"10X", 0, true},
 		{"abc", 0, true},
+		// Overflow: 99999999999G * 1e9 wraps a uint64 multiplication
+		// and would silently cast to a negative int64 without the
+		// bound check.
+		{"99999999999G", 0, true},
+		// Exact int64 ceiling.
+		{"9999999999G", 0, true},
 	}
 	for _, tc := range cases {
 		got, err := parseRate(tc.in)
