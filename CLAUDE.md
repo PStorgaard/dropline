@@ -31,6 +31,19 @@ make e2e            # loopback smoke; needs raw-ICMP privilege
 - **Raw ICMP needs Administrator on Windows for `dropline trace`.**
   Privcheck exits loud; no fallback. `serve` runs unprivileged but
   advertises `reverse_trace=off` without CAP_NET_RAW.
+- **Windows raw ICMP drops TimeExceeded** (issue #1). Windows
+  delivers `EchoReply` to user-space raw sockets but not
+  `TimeExceeded` from intermediate hops, so `dropline trace`'s
+  forward hop table on Windows shows only the destination + maybe
+  the first private hop, even on a healthy path (`tracert` works
+  fine because it uses the higher-level `IcmpSendEcho2Ex` from
+  `iphlpapi.dll`). The reverse trace (Linux server) is unaffected,
+  and the UDP loss test — what the tool is actually for — is
+  unaffected. Real fix is a Windows-only prober via
+  `IcmpSendEcho2Ex` following the same pattern as
+  `stream/kerneldrops_windows.go`. Until then: README has a
+  "Known issue" callout under Windows, and the recommendation is
+  to use a Linux client for full path-trace.
 - **CGO is forbidden** (`CGO_ENABLED=0` is enforced for static
   binaries). Avoid libraries that need it. The TUI clipboard
   (`[c]opy json`) uses OSC 52 instead of a CGO-bound clipboard lib
