@@ -277,3 +277,68 @@ func TestSenderRespectsContext(t *testing.T) {
 		t.Fatal("Run did not return after cancel")
 	}
 }
+
+// TestSenderWriteTargetUnconnected exercises the server-side reverse-
+// direction path: an unconnected listening socket plus a WriteTarget
+// must deliver to that target via WriteToUDP. The legacy connected path
+// would EDESTADDRREQ on this socket, so success here proves the branch.
+func TestSenderWriteTargetUnconnected(t *testing.T) {
+	// Listener that the sender will write into via WriteToUDP. This is
+	// the "client" addr in production.
+	dst, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP dst: %v", err)
+	}
+	defer func() { _ = dst.Close() }()
+	dstAddr := dst.LocalAddr().(*net.UDPAddr)
+
+	// Unconnected listening socket the sender writes from. This mirrors
+	// the production Hub conn the server-side reverse Sender shares.
+	src, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP src: %v", err)
+	}
+	defer func() { _ = src.Close() }()
+
+	const packetSize = 64
+	const pps = 200
+	rateBPS := int64(packetSize * 8 * pps)
+	s, err := NewSender(src, SenderConfig{
+		RateBPS:     rateBPS,
+		PacketSize:  packetSize,
+		Duration:    200 * time.Millisecond,
+		FlowID:      0xDECAFBAD,
+		WriteTarget: dstAddr,
+	})
+	if err != nil {
+		t.Fatalf("NewSender: %v", err)
+	}
+
+	runCtx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	go func() { _ = s.Run(runCtx) }()
+
+	// Read at least one packet on the destination and verify the flow id.
+	if err := dst.SetReadDeadline(time.Now().Add(300 * time.Millisecond)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	buf := make([]byte, packetSize)
+	n, _, err := dst.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("ReadFromUDP: %v", err)
+	}
+	if n != packetSize {
+		t.Fatalf("read %d bytes, want %d", n, packetSize)
+	}
+	h, err := DecodeHeader(buf[:HeaderSize])
+	if err != nil {
+		t.Fatalf("DecodeHeader: %v", err)
+	}
+	if h.FlowID != 0xDECAFBAD {
+		t.Errorf("FlowID = %#x, want 0xDECAFBAD", h.FlowID)
+	}
+	// We don't compare expected bytes count strictly — the test just needs
+	// proof that WriteToUDP is delivering. reflect import retained for
+	// other tests in this file; keep go vet quiet.
+	_ = reflect.DeepEqual
+}

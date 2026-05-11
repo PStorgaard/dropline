@@ -31,6 +31,16 @@ type SenderConfig struct {
 	// the drift-free pacing schedule by the accumulated pause time.
 	// Sessions without pause support pass nil.
 	Gate *PauseGate
+	// WriteTarget, when non-nil, switches the inner write path from
+	// conn.Write (connected socket) to conn.WriteToUDP(buf, target)
+	// (unconnected socket). This is the server-side reverse-direction
+	// path: the server reuses its listening UDP socket — which is bound
+	// but not connected — to transmit back to a specific client address
+	// captured from the forward stream. Setting WriteTarget on a
+	// connected socket would yield EISCONN on Linux; leaving it nil on
+	// an unconnected socket would yield EDESTADDRREQ. Constructors of
+	// SenderConfig must pick the right one for the conn they pass.
+	WriteTarget *net.UDPAddr
 }
 
 // Sender pushes loss-test UDP packets onto a connected *net.UDPConn at a
@@ -45,9 +55,12 @@ type Sender struct {
 	sent   atomic.Int64
 }
 
-// NewSender constructs a Sender. conn must already be connected (e.g. via
-// net.DialUDP) — Sender uses Write, not WriteTo. The body of every packet
-// is allocated and randomized here.
+// NewSender constructs a Sender. By default conn must already be
+// connected (e.g. via net.DialUDP) — Sender uses Write. If
+// cfg.WriteTarget is set, Sender instead uses WriteToUDP(buf,
+// WriteTarget), and conn must be an unconnected listening socket (e.g.
+// from net.ListenUDP). The body of every packet is allocated and
+// randomized here.
 func NewSender(conn *net.UDPConn, cfg SenderConfig) (*Sender, error) {
 	if conn == nil {
 		return nil, errors.New("stream: nil conn")
@@ -144,8 +157,14 @@ func (s *Sender) Run(ctx context.Context) error {
 		EncodeHeader(buf, h)
 		copy(buf[HeaderSize:], s.body)
 
-		if _, err := s.conn.Write(buf); err != nil {
-			return fmt.Errorf("stream: write seq %d: %w", seq, err)
+		var werr error
+		if s.cfg.WriteTarget != nil {
+			_, werr = s.conn.WriteToUDP(buf, s.cfg.WriteTarget)
+		} else {
+			_, werr = s.conn.Write(buf)
+		}
+		if werr != nil {
+			return fmt.Errorf("stream: write seq %d: %w", seq, werr)
 		}
 		s.sent.Add(1)
 		seq++
