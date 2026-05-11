@@ -1,0 +1,15 @@
+[Unit]
+Description=dropline loss-test server
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/dropline serve --listen :5301
+DynamicUser=yes
+Restart=on-failure
+LimitNOFILE=65536
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

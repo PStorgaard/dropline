@@ -1,0 +1,53 @@
+version: "2"
+
+run:
+  timeout: 3m
+
+linters:
+  default: none
+  enable:
+    - errcheck       # unchecked errors
+    - govet          # stdlib vet checks
+    - ineffassign    # assignments to unused variables
+    - staticcheck    # high-signal correctness + simplifications
+    - unused         # unused funcs/vars/types/fields
+    - misspell       # English spelling
+    - revive         # configurable replacement for golint
+    - errorlint      # errors.Is/As best practices
+    - unconvert      # redundant type conversions
+    - unparam        # unused function parameters / always-same returns
+    - bodyclose      # HTTP response.Body left unclosed
+    - gosec          # security heuristics
+  settings:
+    revive:
+      rules:
+        - name: var-naming
+        - name: package-comments
+        - name: exported
+          arguments:
+            - disableStutteringCheck
+        - name: error-return
+        - name: error-naming
+        - name: if-return
+        - name: increment-decrement
+        - name: range
+        - name: receiver-naming
+        - name: time-naming
+        - name: unused-parameter
+        - name: unreachable-code
+    gosec:
+      excludes:
+        - G104   # duplicates errcheck
+    errcheck:
+      exclude-functions:
+        - (io.Closer).Close
+        - (net.Conn).Close
+        - (net.Listener).Close
+        - (*github.com/PStorgaard/dropline/internal/control.Conn).Close
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - gosec
+          - errcheck
+          - unparam
