@@ -15,12 +15,27 @@ func TestMessageRoundTrip(t *testing.T) {
 		in   Message
 	}{
 		{"hello", &Hello{Type: TypeHello, Version: 1, Mode: "loss", RateBPS: 10_000_000, DurationMS: 60_000, PacketSize: 1200, FlowID: 2847391057, MTRIntervalMS: 2500}},
+		{"hello_reverse_stream", &Hello{
+			Type: TypeHello, Version: 1, Mode: "loss", RateBPS: 5_000_000, DurationMS: 60_000,
+			PacketSize: 1200, FlowID: 11, ReverseStream: "auto", ReverseFlowID: 22,
+			TCPCorroborate: "auto", TCPCorroborateRateBPS: 100_000,
+		}},
 		{"ready", &Ready{Type: TypeReady, SessionID: "abc-123"}},
+		{"ready_reverse_stream", &Ready{
+			Type: TypeReady, SessionID: "xyz-987",
+			ReverseStream: "on", ReverseFlowID: 22, TCPCorroborate: "on",
+		}},
 		{"error", &Error{Type: TypeError, Reason: "server busy"}},
 		{"stats", &Stats{Type: TypeStats, T: 12.0, Recv: 12450, Loss: 3, JitterMS: 0.41, KernelDrops: 0}},
 		{"final", &Final{Type: TypeFinal, Stats: FinalStats{Recv: 600000, Loss: 12, JitterMS: 0.5, KernelDrops: 0, DurationS: 60.0}}},
+		{"final_with_reverse_and_tcp", &Final{Type: TypeFinal, Stats: FinalStats{
+			Recv: 60000, Loss: 12, DurationS: 60.0,
+			ReverseSent: 60000, ReverseDurationS: 60.0,
+			TCPBytesRetrans: 12345, TCPBytesOut: 7_500_000,
+		}}},
 		{"pause_true", &Pause{Type: TypePause, Paused: true}},
 		{"pause_false", &Pause{Type: TypePause, Paused: false}},
+		{"tcp_probe", &TCPProbe{Type: TypeTCPProbe, SessionID: "abc-123", RateBPS: 100_000}},
 		{"reverse_hop_update", &ReverseHopUpdate{
 			Type: TypeReverseHopUpdate, TTL: 7, Addr: "203.0.113.4",
 			RTTMS: 14.2, LossPct: 0.0, Terminus: "host",
@@ -145,6 +160,72 @@ func TestReverseHopUpdateRichRoundTrip(t *testing.T) {
 	}
 	if !reflect.DeepEqual(in, &got) {
 		t.Fatalf("round-trip mismatch:\n want %#v\n  got %#v", in, &got)
+	}
+}
+
+// Hello's new reverse-stream / tcp-corroborate fields are omitempty so an
+// old client's wire bytes stay byte-identical (no surprise keys for
+// pre-feature servers to special-case).
+func TestHelloReverseStreamAndTCPOmitemptyZero(t *testing.T) {
+	h := &Hello{Type: TypeHello, Version: 1, Mode: "loss", RateBPS: 1, DurationMS: 1, PacketSize: 64, FlowID: 1}
+	raw, err := json.Marshal(h)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	for _, key := range []string{
+		`"reverse_stream"`, `"reverse_flow_id"`,
+		`"tcp_corroborate"`, `"tcp_corroborate_rate_bps"`,
+	} {
+		if bytes.Contains(raw, []byte(key)) {
+			t.Errorf("zero %s should be omitted; got %s", key, raw)
+		}
+	}
+}
+
+// Ready's new fields are omitempty so an old server's wire bytes stay
+// byte-identical to a new client reading them.
+func TestReadyReverseStreamAndTCPOmitemptyZero(t *testing.T) {
+	r := &Ready{Type: TypeReady, SessionID: "x"}
+	raw, err := json.Marshal(r)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	for _, key := range []string{`"reverse_stream"`, `"reverse_flow_id"`, `"tcp_corroborate"`} {
+		if bytes.Contains(raw, []byte(key)) {
+			t.Errorf("zero %s should be omitted; got %s", key, raw)
+		}
+	}
+}
+
+// FinalStats' new reverse / tcp-corroborate fields are omitempty so an
+// old server's Final keeps byte-for-byte parity with the v1 schema.
+func TestFinalStatsReverseAndTCPOmitemptyZero(t *testing.T) {
+	s := &FinalStats{Sent: 1, Recv: 1, DurationS: 1.0}
+	raw, err := json.Marshal(s)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	for _, key := range []string{
+		`"reverse_sent"`, `"reverse_duration_s"`,
+		`"tcp_bytes_retrans"`, `"tcp_bytes_out"`,
+	} {
+		if bytes.Contains(raw, []byte(key)) {
+			t.Errorf("zero %s should be omitted; got %s", key, raw)
+		}
+	}
+}
+
+// TCPProbe.RateBPS is omitempty: a client that doesn't advertise a rate
+// produces no key, so future servers that ignore the field can stay
+// agnostic to its presence.
+func TestTCPProbeRateOmitemptyZero(t *testing.T) {
+	p := &TCPProbe{Type: TypeTCPProbe, SessionID: "x"}
+	raw, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if bytes.Contains(raw, []byte(`"rate_bps"`)) {
+		t.Errorf("zero rate_bps should be omitted; got %s", raw)
 	}
 }
 

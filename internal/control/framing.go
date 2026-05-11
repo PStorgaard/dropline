@@ -96,6 +96,8 @@ func ReadMessage(r io.Reader) (Message, error) {
 		msg = &ReverseHopUpdate{}
 	case TypePause:
 		msg = &Pause{}
+	case TypeTCPProbe:
+		msg = &TCPProbe{}
 	default:
 		return nil, fmt.Errorf("%w: %q", ErrUnknownType, string(env.Type))
 	}

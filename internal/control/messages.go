@@ -12,6 +12,13 @@ const (
 	TypeFinal            Type = "final"
 	TypeReverseHopUpdate Type = "reverse_hop_update"
 	TypePause            Type = "pause"
+	// TypeTCPProbe is sent by a client opening a *second* TCP connection
+	// to the dropline server port for TCP retransmit corroboration. The
+	// server's accept loop dispatches by first-message type: Hello → a
+	// loss-test session, TCPProbe → the probe handler that reads and
+	// discards bytes for the test's duration so the client's TCP stack
+	// has something to retransmit.
+	TypeTCPProbe Type = "tcp_probe"
 )
 
 // Reverse-path status values. Reported as `reverse_path_status` in the
@@ -63,6 +70,29 @@ type Hello struct {
 	// directions sweep in lockstep. Zero/missing (old client) falls back
 	// to 1s server-side.
 	MTRIntervalMS int64 `json:"mtr_interval_ms,omitempty"`
+	// ReverseStream is the client's reverse-direction UDP loss preference:
+	// "on", "off", or "auto". Empty/absent on the wire means the client
+	// doesn't know about reverse-stream (pre-feature build) and the server
+	// treats it as "off". Resolution mirrors ReverseTrace.
+	ReverseStream string `json:"reverse_stream,omitempty"`
+	// ReverseFlowID is the FlowID the server should stamp on its
+	// reverse-direction UDP packets so the client's Receiver can filter
+	// them out from any stray traffic on its dialed socket. Distinct from
+	// FlowID (which is forward-direction). Zero/absent (old client) means
+	// reverse-stream is off regardless of ReverseStream.
+	ReverseFlowID uint32 `json:"reverse_flow_id,omitempty"`
+	// TCPCorroborate is the client's TCP retransmit corroboration
+	// preference: "on", "off", or "auto". When resolved "on", the client
+	// opens a second TCP connection to the dropline server and streams
+	// dummy bytes for the test duration, sampling its own TCP_INFO.
+	// Empty/absent (old client) → server treats as "off".
+	TCPCorroborate string `json:"tcp_corroborate,omitempty"`
+	// TCPCorroborateRateBPS is the bit-rate the client intends to push on
+	// the corroboration TCP probe. The server doesn't need this value to
+	// function (it just reads-and-discards), but it's included so the
+	// server can reject implausible rates if needed. Zero/absent means
+	// the server-side handler doesn't enforce anything.
+	TCPCorroborateRateBPS int64 `json:"tcp_corroborate_rate_bps,omitempty"`
 }
 
 // Ready acknowledges a Hello and carries the server-assigned session ID.
@@ -74,6 +104,19 @@ type Ready struct {
 	Type         Type   `json:"type"`
 	SessionID    string `json:"session_id"`
 	ReverseTrace string `json:"reverse_trace,omitempty"`
+	// ReverseStream is the server's resolved decision: "on" if the server
+	// will stream UDP back to the client during this session, "off"
+	// otherwise. Empty/absent (old server) means "off" to a new client.
+	ReverseStream string `json:"reverse_stream,omitempty"`
+	// ReverseFlowID echoes the client's request when accepted, or is zero
+	// when the server declined reverse-stream. Distinct from FlowID
+	// (which is the forward-direction id).
+	ReverseFlowID uint32 `json:"reverse_flow_id,omitempty"`
+	// TCPCorroborate is the server's resolved decision: "on" if the
+	// server is prepared to accept a TCP corroboration probe connection
+	// for this session, "off" otherwise. Empty/absent (old server) means
+	// "off" to a new client.
+	TCPCorroborate string `json:"tcp_corroborate,omitempty"`
 }
 
 // Error reports a session-fatal condition (server busy, version mismatch, …).
@@ -94,6 +137,13 @@ type Stats struct {
 
 // FinalStats summarizes a completed test. Field set tracks the
 // JSON-output schema in spec § JSON output.
+//
+// New-in-v2 fields (ReverseSent, ReverseDurationS, TCPBytesRetrans,
+// TCPBytesOut) are omitempty so an old server's wire bytes remain
+// byte-identical when the feature isn't active. A new client reading an
+// old server's Final sees zero values, which renderers treat as "no
+// reverse-stream / no tcp-corroborate data for this session" and skip
+// the corresponding sections.
 type FinalStats struct {
 	Sent        int64        `json:"sent"`
 	Recv        int64        `json:"recv"`
@@ -106,6 +156,25 @@ type FinalStats struct {
 	Bursts      BurstBuckets `json:"bursts"`
 	RateTxBPS   int64        `json:"rate_tx_bps"`
 	RateRxBPS   int64        `json:"rate_rx_bps"`
+	// ReverseSent is the count of UDP packets the server transmitted back
+	// to the client during the reverse-stream sub-test. Zero when reverse
+	// stream was off for this session.
+	ReverseSent int64 `json:"reverse_sent,omitempty"`
+	// ReverseDurationS is the wall-clock duration the server's reverse
+	// Sender actually ran for. Useful for the client to validate its own
+	// recv-window. Zero when reverse stream was off.
+	ReverseDurationS float64 `json:"reverse_duration_s,omitempty"`
+	// TCPBytesRetrans is the cumulative count of TCP bytes the server's
+	// kernel believes it retransmitted on the corroboration probe socket
+	// for this session. Server-side observation; the client also samples
+	// its own end independently. Zero when tcp-corroborate was off or
+	// when the server's platform doesn't expose TCP_INFO.
+	TCPBytesRetrans uint64 `json:"tcp_bytes_retrans,omitempty"`
+	// TCPBytesOut is the cumulative count of TCP bytes the server's
+	// kernel sent (including retransmits) on the corroboration probe
+	// socket. Used by the client as a denominator if it wants the
+	// server-side retransmit fraction. Zero when tcp-corroborate was off.
+	TCPBytesOut uint64 `json:"tcp_bytes_out,omitempty"`
 }
 
 // BurstBuckets is the loss-burst histogram carried in FinalStats.
@@ -164,6 +233,27 @@ type ReverseHopUpdate struct {
 	MaxTTL int `json:"max_ttl,omitempty"`
 }
 
+// TCPProbe is the first message a client sends on a *second* TCP
+// connection to the dropline server port, opted-in via Hello's
+// TCPCorroborate. The server's accept loop dispatches by first-message
+// type: Hello → a normal loss-test session, TCPProbe → the probe
+// handler that reads and discards bytes until the connection closes or
+// the test's duration elapses, so the client's TCP stack has something
+// to retransmit.
+//
+// SessionID matches the Ready.SessionID the client received on its
+// control channel. The server doesn't strictly require it to function
+// (each probe socket is independent) but logging it lets operators
+// correlate probe traffic with a session in server-side traces.
+//
+// RateBPS is the bit rate the client intends to push on this probe.
+// The server-side handler doesn't enforce it — the field is advisory.
+type TCPProbe struct {
+	Type      Type   `json:"type"`
+	SessionID string `json:"session_id"`
+	RateBPS   int64  `json:"rate_bps,omitempty"`
+}
+
 // Pause is a client→server toggle that halts (or resumes) the stats
 // forwarder for the current session. Idempotent — re-sending the same
 // state is a no-op. The first non-Hello message in the client→server
@@ -183,3 +273,4 @@ func (*Stats) controlMessage()            {}
 func (*Final) controlMessage()            {}
 func (*ReverseHopUpdate) controlMessage() {}
 func (*Pause) controlMessage()            {}
+func (*TCPProbe) controlMessage()         {}
