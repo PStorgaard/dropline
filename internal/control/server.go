@@ -16,13 +16,28 @@ import (
 // in-flight connections on shutdown.
 type Handler func(ctx context.Context, c *Conn, hello *Hello) error
 
+// ProbeHandler is the parallel dispatch for connections whose first
+// message is a TCPProbe rather than a Hello. The dropline TCP-corro-
+// boration probe re-uses the control-channel port (one bound socket
+// for both control and probe traffic); the server's accept loop sniffs
+// the first message and routes accordingly. ProbeHandler receives the
+// raw net.Conn — not a control.Conn — because the probe protocol after
+// the first message is just a unidirectional stream of dummy bytes
+// that don't follow the control framing.
+//
+// ProbeHandler may be nil; if it is, a TCPProbe first-message produces
+// a typed Error reply on the *control.Conn and the connection is
+// closed.
+type ProbeHandler func(ctx context.Context, nc net.Conn, probe *TCPProbe)
+
 // Server accepts control-channel connections and dispatches each to Handler
 // after parsing the client's Hello. Concurrency caps (e.g. max concurrent
 // sessions) live in the Handler closure — see cmd/dropline/serve.go's
 // newServeHandler — so this package stays free of admission policy.
 type Server struct {
-	Addr    string
-	Handler Handler
+	Addr         string
+	Handler      Handler
+	ProbeHandler ProbeHandler
 }
 
 // ListenAndServe binds Addr and serves until ctx is canceled. Accept errors
@@ -100,20 +115,35 @@ func isTemporary(err error) bool {
 
 func (s *Server) handle(ctx context.Context, nc net.Conn) {
 	c := NewConn(nc)
-	defer c.Close()
 	// Bound the Hello read so an idle peer cannot pin this goroutine
-	// indefinitely. Clear the deadline once Hello is parsed so the
-	// Handler can set its own I/O policy.
+	// indefinitely. Clear the deadline once the first message is parsed
+	// so the Handler can set its own I/O policy.
 	_ = nc.SetReadDeadline(time.Now().Add(HelloReadTimeout))
 	msg, err := c.Recv()
 	if err != nil {
+		_ = c.Close()
 		return
 	}
 	_ = nc.SetReadDeadline(time.Time{})
-	hello, ok := msg.(*Hello)
-	if !ok {
+	switch m := msg.(type) {
+	case *Hello:
+		defer c.Close()
+		_ = s.Handler(ctx, c, m)
+	case *TCPProbe:
+		// The probe handler reads/discards bytes directly off the raw
+		// connection until close — no further control framing applies.
+		// We intentionally do NOT defer c.Close here so the handler
+		// owns the conn lifecycle (the c wrapper holds buffered state
+		// we'd otherwise discard mid-read).
+		if s.ProbeHandler == nil {
+			_ = c.Send(&Error{Type: TypeError, Reason: "tcp_probe not supported by this server"})
+			_ = c.Close()
+			return
+		}
+		s.ProbeHandler(ctx, nc, m)
+		_ = nc.Close()
+	default:
 		_ = c.Send(&Error{Type: TypeError, Reason: "expected hello"})
-		return
+		_ = c.Close()
 	}
-	_ = s.Handler(ctx, c, hello)
 }

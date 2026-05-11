@@ -119,7 +119,10 @@ func serveRun(ctx context.Context, cfg serveConfig) error {
 		_ = hub.Run(ctx)
 	}()
 
-	srv := &control.Server{Handler: newServeHandler(hub, rawICMP.OK, cfg.maxSessions)}
+	srv := &control.Server{
+		Handler:      newServeHandler(hub, rawICMP.OK, cfg.maxSessions),
+		ProbeHandler: handleTCPProbe,
+	}
 	err = srv.Serve(ctx, tcpLn)
 	<-hubDone
 	return err
@@ -542,6 +545,37 @@ func validateHello(h *control.Hello) string {
 		return fmt.Sprintf("rate_bps must be > 0, got %d", h.RateBPS)
 	}
 	return ""
+}
+
+// handleTCPProbe is the server-side discard sink for TCP retransmit
+// corroboration. After the client's TCPProbe first message has been
+// parsed by control.Server, this handler reads bytes off the raw conn
+// in a tight loop and discards them. The client's TCP_INFO sampling
+// happens on the client side; the server has no diagnostic role here
+// beyond keeping the connection open so the kernel keeps transmitting.
+//
+// The function returns when the client closes the connection, when ctx
+// is canceled (server shutdown), or when the read returns a non-EOF
+// error. We don't bound the lifetime with hello.DurationMS — the
+// client controls its end of the conn and closes when done.
+func handleTCPProbe(ctx context.Context, nc net.Conn, probe *control.TCPProbe) {
+	// Close the conn on ctx done so a long-lived peer doesn't keep the
+	// goroutine alive past server shutdown.
+	doneCh := make(chan struct{})
+	defer close(doneCh)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = nc.Close()
+		case <-doneCh:
+		}
+	}()
+	buf := make([]byte, 32<<10)
+	for {
+		if _, err := nc.Read(buf); err != nil {
+			return
+		}
+	}
 }
 
 func mintSessionID() (string, error) {
