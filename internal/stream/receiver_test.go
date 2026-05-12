@@ -219,3 +219,61 @@ loop:
 		t.Fatalf("expected ≥2 snapshots in 200ms, got %d", got)
 	}
 }
+
+// TestReceiverFiltersByToken pins direct-conn receiver behavior: with
+// ReceiverConfig.Token set, packets stamped with a different Token are
+// silently dropped (no recv, no local-drop accounting).
+func TestReceiverFiltersByToken(t *testing.T) {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	const expected uint64 = 0xCAFEBEEFDEADBEEF
+	r, err := NewReceiver(conn, ReceiverConfig{Tick: -1, Token: expected})
+	if err != nil {
+		t.Fatalf("NewReceiver: %v", err)
+	}
+
+	addr := conn.LocalAddr().(*net.UDPAddr)
+	sender, err := net.DialUDP("udp4", nil, addr)
+	if err != nil {
+		t.Fatalf("DialUDP: %v", err)
+	}
+	defer func() { _ = sender.Close() }()
+
+	buf := make([]byte, 64)
+	// 3 mismatched (wrong token) + 2 matched. Only the 2 matched count.
+	for i := uint64(0); i < 3; i++ {
+		EncodeHeader(buf, Header{Magic: Magic, FlowID: 1, Seq: i, TxUnixNS: time.Now().UnixNano(), Token: 0x1})
+		if _, err := sender.Write(buf); err != nil {
+			t.Fatalf("Write mismatched: %v", err)
+		}
+	}
+	for i := uint64(0); i < 2; i++ {
+		EncodeHeader(buf, Header{Magic: Magic, FlowID: 1, Seq: i + 3, TxUnixNS: time.Now().UnixNano(), Token: expected})
+		if _, err := sender.Write(buf); err != nil {
+			t.Fatalf("Write matched: %v", err)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	type result struct {
+		s   Snapshot
+		err error
+	}
+	done := make(chan result, 1)
+	go func() { s, err := r.Run(ctx); done <- result{s, err} }()
+
+	time.Sleep(250 * time.Millisecond)
+	cancel()
+
+	res := <-done
+	if res.err != nil && !errors.Is(res.err, net.ErrClosed) && !isTimeout(res.err) {
+		t.Fatalf("Run: %v", res.err)
+	}
+	if res.s.Recv != 2 {
+		t.Fatalf("recv: want 2 (only matched-token packets), got %d", res.s.Recv)
+	}
+}

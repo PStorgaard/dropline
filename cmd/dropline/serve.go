@@ -182,13 +182,19 @@ func runServerLoops(ctx context.Context, hubRun, tcpServe func(context.Context) 
 	serveCtx, serveCancel := context.WithCancel(ctx)
 	defer serveCancel()
 
+	// sync.Once + plain error replaces an earlier atomic.Value: the latter
+	// panics on the second CompareAndSwap if hubRun and tcpServe race to
+	// store errors with different concrete types (e.g. *net.OpError vs
+	// *fmt.wrapError). wg.Wait below establishes the happens-before for
+	// the firstErr read.
 	var (
 		wg       sync.WaitGroup
-		firstErr atomic.Value // holds error
+		errOnce  sync.Once
+		firstErr error
 	)
 	fail := func(err error) {
 		if err != nil && !errors.Is(err, context.Canceled) {
-			firstErr.CompareAndSwap(nil, err)
+			errOnce.Do(func() { firstErr = err })
 		}
 		serveCancel()
 	}
@@ -206,10 +212,7 @@ func runServerLoops(ctx context.Context, hubRun, tcpServe func(context.Context) 
 	}()
 
 	wg.Wait()
-	if e, _ := firstErr.Load().(error); e != nil {
-		return e
-	}
-	return nil
+	return firstErr
 }
 
 // newServeHandler returns a control.Handler that admits up to
@@ -242,9 +245,22 @@ func newServeHandler(hub *stream.Hub, reverseCapable bool, maxSessions int, maxR
 // waiting for the flat probeMaxLifetime ceiling. tcpProbeOK records
 // whether this session negotiated tcp_corroborate="on"; probes against
 // sessions where it's false are rejected.
+//
+// clientIP pins the TCP control conn's source address so the probe
+// handler can reject any TCPProbe dial that arrives from a different IP
+// — a peer who has the session_id but not the control-plane vantage
+// point can't open a probe. nil clientIP (non-TCPv4 control conn) is
+// treated as "no probes allowed" at admission time.
+//
+// probeRate is the negotiated Hello.TCPCorroborateRateBPS the probe
+// handler enforces via read-side backpressure. Zero means "no cap"
+// (legacy/test path); production Hello always carries a positive rate
+// when tcp_corroborate is on.
 type sessionState struct {
 	ctx        context.Context
 	tcpProbeOK bool
+	clientIP   net.IP
+	probeRate  int64
 }
 
 // sessionRegistry tracks the set of session IDs currently held by a
@@ -313,7 +329,7 @@ func handleSession(ctx context.Context, c *control.Conn, hello *control.Hello, h
 	// terminal Error rather than a Ready-then-Error sequence. The Hub's
 	// panicking Register is reserved for invariants the server controls;
 	// flow_id comes from an untrusted Hello, so use TryRegister.
-	flowHandle, ok := hub.TryRegister(hello.FlowID, stream.DefaultRingSize, clientIP)
+	flowHandle, ok := hub.TryRegister(hello.FlowID, stream.DefaultRingSize, clientIP, hello.Token)
 	if !ok {
 		return c.Send(&control.Error{Type: control.TypeError, Reason: "flow_id collision; retry with a fresh flow_id"})
 	}
@@ -328,8 +344,16 @@ func handleSession(ctx context.Context, c *control.Conn, hello *control.Hello, h
 	// may dial the TCP probe socket immediately — if reg.add hadn't
 	// happened yet, the probe handler would reject as "unknown or
 	// expired session_id". tcpProbeOK gates probe admission to
-	// sessions that actually negotiated corroboration.
-	reg.add(sid, sessionState{ctx: sessionCtx, tcpProbeOK: tcpCorroborateDecision == "on"})
+	// sessions that actually negotiated corroboration. clientIP and
+	// probeRate thread the control-conn IP + negotiated rate into
+	// newProbeHandler so probes from other IPs are rejected and the
+	// reader is rate-limited.
+	reg.add(sid, sessionState{
+		ctx:        sessionCtx,
+		tcpProbeOK: tcpCorroborateDecision == "on",
+		clientIP:   clientIP,
+		probeRate:  hello.TCPCorroborateRateBPS,
+	})
 	defer reg.remove(sid)
 
 	if err := c.Send(&control.Ready{
@@ -511,6 +535,7 @@ func runReverseStream(ctx context.Context, wg *sync.WaitGroup, hub *stream.Hub, 
 		Duration:    duration,
 		FlowID:      reverseFlowID,
 		WriteTarget: clientAddr,
+		Token:       hello.Token,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "dropline serve: reverse-stream sender init failed: %s\n", err)
@@ -714,6 +739,15 @@ func validateHello(h *control.Hello, maxRateBPS int64) string {
 	if h.Mode != "loss" {
 		return fmt.Sprintf("unsupported mode %q (server supports \"loss\")", h.Mode)
 	}
+	// Token is the per-session secret stamped into every UDP packet's
+	// Header.Token. The server uses it to defeat same-NAT / on-path
+	// injection that knows only flow_id + source IP. A zero token means
+	// the client either omitted the field (pre-feature build) or chose
+	// not to mint one; either way no integrity gate is possible, so
+	// reject up front rather than silently degrade.
+	if h.Token == 0 {
+		return "token required (zero is reserved as \"no token\")"
+	}
 	if h.PacketSize < stream.HeaderSize || h.PacketSize > stream.MaxPacketSize {
 		return fmt.Sprintf("packet_size %d out of range [%d,%d]", h.PacketSize, stream.HeaderSize, stream.MaxPacketSize)
 	}
@@ -796,6 +830,15 @@ func newProbeHandler(reg *sessionRegistry, maxProbes int) control.ProbeHandler {
 			_ = control.WriteMessage(nc, &control.Error{Type: control.TypeError, Reason: "tcp_probe: not negotiated for this session"})
 			return
 		}
+		// Bind the probe to the control-conn's source IP. A peer with
+		// the session_id but a different vantage point (e.g. it leaked
+		// via logs / sidecars) cannot open a probe — the only IP that
+		// can is the one that holds the control channel.
+		peer, peerOK := nc.RemoteAddr().(*net.TCPAddr)
+		if !peerOK || st.clientIP == nil || !peer.IP.To4().Equal(st.clientIP) {
+			_ = control.WriteMessage(nc, &control.Error{Type: control.TypeError, Reason: "tcp_probe: source IP does not match control connection"})
+			return
+		}
 		select {
 		case sem <- struct{}{}:
 			defer func() { <-sem }()
@@ -821,11 +864,32 @@ func newProbeHandler(reg *sessionRegistry, maxProbes int) control.ProbeHandler {
 			}
 		}()
 
+		// Backpressure-based rate enforcement: when the session
+		// negotiated a non-zero TCPCorroborateRateBPS, slow our reads
+		// once the peer outpaces that rate. TCP receive-window flow
+		// control then throttles the sender. No conn-close on transient
+		// bursts. probeRate==0 preserves today's unmetered behavior for
+		// loopback/test paths that don't advertise a rate.
 		buf := make([]byte, 32<<10)
+		var total int64
+		start := time.Now()
 		for {
 			_ = nc.SetReadDeadline(time.Now().Add(probeIdleTimeout))
-			if _, err := nc.Read(buf); err != nil {
+			n, err := nc.Read(buf)
+			if err != nil {
 				return
+			}
+			total += int64(n)
+			if st.probeRate > 0 {
+				expected := time.Duration(total*8*int64(time.Second) / st.probeRate)
+				elapsed := time.Since(start)
+				if extra := expected - elapsed; extra > 10*time.Millisecond {
+					select {
+					case <-time.After(extra):
+					case <-probeCtx.Done():
+						return
+					}
+				}
 			}
 		}
 	}

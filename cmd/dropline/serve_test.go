@@ -100,7 +100,7 @@ func TestParseServeArgsErrors(t *testing.T) {
 
 func TestValidateHello(t *testing.T) {
 	good := &control.Hello{Type: control.TypeHello, Version: 1, Mode: "loss",
-		RateBPS: 1_000_000, DurationMS: 1000, PacketSize: 1200, FlowID: 1}
+		RateBPS: 1_000_000, DurationMS: 1000, PacketSize: 1200, FlowID: 1, Token: 0xABCDEF12}
 	if reason := validateHello(good, 0); reason != "" {
 		t.Fatalf("good hello rejected: %s", reason)
 	}
@@ -137,7 +137,7 @@ func TestValidateHello(t *testing.T) {
 // cap rejects rates above it with the documented error substring.
 func TestValidateHelloRateCap(t *testing.T) {
 	good := &control.Hello{Type: control.TypeHello, Version: 1, Mode: "loss",
-		RateBPS: 10_000_000, DurationMS: 1000, PacketSize: 1200, FlowID: 1}
+		RateBPS: 10_000_000, DurationMS: 1000, PacketSize: 1200, FlowID: 1, Token: 0xABCDEF12}
 
 	if reason := validateHello(good, 0); reason != "" {
 		t.Errorf("cap=0 should disable the limit; got %q", reason)
@@ -191,7 +191,7 @@ func TestValidateHelloRateCap(t *testing.T) {
 // inclusive, anything outside is rejected.
 func TestValidateHelloMTRBounds(t *testing.T) {
 	base := &control.Hello{Type: control.TypeHello, Version: 1, Mode: "loss",
-		RateBPS: 1_000_000, DurationMS: 1000, PacketSize: 1200, FlowID: 1}
+		RateBPS: 1_000_000, DurationMS: 1000, PacketSize: 1200, FlowID: 1, Token: 0xABCDEF12}
 
 	cases := []struct {
 		name   string
@@ -225,7 +225,7 @@ func TestValidateHelloMTRBounds(t *testing.T) {
 // the renderer has to mark the verdict suspect.
 func TestBuildFinalCopiesLocalDrops(t *testing.T) {
 	hello := &control.Hello{Type: control.TypeHello, Version: 1, Mode: "loss",
-		RateBPS: 1_000_000, DurationMS: 1000, PacketSize: 1200, FlowID: 1}
+		RateBPS: 1_000_000, DurationMS: 1000, PacketSize: 1200, FlowID: 1, Token: 0xABCDEF12}
 	snap := stream.Snapshot{
 		Recv:        42,
 		Lost:        7,
@@ -326,7 +326,7 @@ func TestServeRejectsBadHello(t *testing.T) {
 
 	if err := c.Send(&control.Hello{
 		Type: control.TypeHello, Version: 99, Mode: "loss",
-		RateBPS: 1, DurationMS: 1, PacketSize: 64, FlowID: 1,
+		RateBPS: 1, DurationMS: 1, PacketSize: 64, FlowID: 1, Token: 0xABCDEF12,
 	}); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
@@ -363,6 +363,7 @@ func TestServeHappyPath(t *testing.T) {
 		DurationMS: 250,
 		PacketSize: packetSize,
 		FlowID:     flowID,
+		Token:      0xABCDEF12,
 	}
 	if err := c.Send(hello); err != nil {
 		t.Fatalf("Send hello: %v", err)
@@ -389,7 +390,7 @@ func TestServeHappyPath(t *testing.T) {
 	buf := make([]byte, packetSize)
 	for i := uint64(0); i < 5; i++ {
 		stream.EncodeHeader(buf, stream.Header{
-			Magic: stream.Magic, FlowID: flowID, Seq: i, TxUnixNS: time.Now().UnixNano(),
+			Magic: stream.Magic, FlowID: flowID, Seq: i, TxUnixNS: time.Now().UnixNano(), Token: 0xABCDEF12,
 		})
 		if _, err := sender.Write(buf); err != nil {
 			t.Fatalf("Write: %v", err)
@@ -446,6 +447,7 @@ func runOneSession(t *testing.T, ctx context.Context, tcpAddr string, udpAddr *n
 		DurationMS: 500,
 		PacketSize: packetSize,
 		FlowID:     flowID,
+		Token:      0xABCDEF12,
 	}
 	if err := c.Send(hello); err != nil {
 		t.Fatalf("Send hello: %v", err)
@@ -466,7 +468,7 @@ func runOneSession(t *testing.T, ctx context.Context, tcpAddr string, udpAddr *n
 	buf := make([]byte, packetSize)
 	for i := uint64(0); i < uint64(packets); i++ {
 		stream.EncodeHeader(buf, stream.Header{
-			Magic: stream.Magic, FlowID: flowID, Seq: i, TxUnixNS: time.Now().UnixNano(),
+			Magic: stream.Magic, FlowID: flowID, Seq: i, TxUnixNS: time.Now().UnixNano(), Token: 0xABCDEF12,
 		})
 		if _, err := sender.Write(buf); err != nil {
 			t.Fatalf("Write: %v", err)
@@ -535,7 +537,7 @@ func TestServeRejectsOverMaxSessions(t *testing.T) {
 	defer func() { _ = c1.Close() }()
 	if err := c1.Send(&control.Hello{
 		Type: control.TypeHello, Version: 1, Mode: "loss",
-		RateBPS: 1_000_000, DurationMS: 5_000, PacketSize: 64, FlowID: 1,
+		RateBPS: 1_000_000, DurationMS: 5_000, PacketSize: 64, FlowID: 1, Token: 0xABCDEF12,
 	}); err != nil {
 		t.Fatalf("Send 1: %v", err)
 	}
@@ -551,7 +553,7 @@ func TestServeRejectsOverMaxSessions(t *testing.T) {
 	defer func() { _ = c2.Close() }()
 	if err := c2.Send(&control.Hello{
 		Type: control.TypeHello, Version: 1, Mode: "loss",
-		RateBPS: 1_000_000, DurationMS: 100, PacketSize: 64, FlowID: 2,
+		RateBPS: 1_000_000, DurationMS: 100, PacketSize: 64, FlowID: 2, Token: 0xABCDEF12,
 	}); err != nil {
 		t.Fatalf("Send 2: %v", err)
 	}
@@ -633,6 +635,7 @@ func TestServePauseStopsStats(t *testing.T) {
 		Type: control.TypeHello, Version: 1, Mode: "loss",
 		RateBPS: int64(packetSize) * 8 * 100, DurationMS: 3000,
 		PacketSize: packetSize, FlowID: flowID,
+		Token: 0xABCDEF12,
 	}
 	if err := c.Send(hello); err != nil {
 		t.Fatalf("Send hello: %v", err)
@@ -663,7 +666,7 @@ func TestServePauseStopsStats(t *testing.T) {
 				return
 			case <-ticker.C:
 				stream.EncodeHeader(buf, stream.Header{
-					Magic: stream.Magic, FlowID: flowID, Seq: seq, TxUnixNS: time.Now().UnixNano(),
+					Magic: stream.Magic, FlowID: flowID, Seq: seq, TxUnixNS: time.Now().UnixNano(), Token: 0xABCDEF12,
 				})
 				_, _ = sender.Write(buf)
 				seq++
@@ -741,7 +744,7 @@ func TestServeUnexpectedSecondMessageDisconnects(t *testing.T) {
 
 	hello := &control.Hello{
 		Type: control.TypeHello, Version: 1, Mode: "loss",
-		RateBPS: 1_000_000, DurationMS: 3000, PacketSize: 64, FlowID: 1,
+		RateBPS: 1_000_000, DurationMS: 3000, PacketSize: 64, FlowID: 1, Token: 0xABCDEF12,
 	}
 	if err := c.Send(hello); err != nil {
 		t.Fatalf("Send hello: %v", err)
@@ -803,7 +806,7 @@ func TestServeRejectsDuplicateFlowID(t *testing.T) {
 	defer func() { _ = c1.Close() }()
 	if err := c1.Send(&control.Hello{
 		Type: control.TypeHello, Version: 1, Mode: "loss",
-		RateBPS: 1_000_000, DurationMS: 3_000, PacketSize: 64, FlowID: sharedFlow,
+		RateBPS: 1_000_000, DurationMS: 3_000, PacketSize: 64, FlowID: sharedFlow, Token: 0xABCDEF12,
 	}); err != nil {
 		t.Fatalf("Send 1: %v", err)
 	}
@@ -819,7 +822,7 @@ func TestServeRejectsDuplicateFlowID(t *testing.T) {
 	defer func() { _ = c2.Close() }()
 	if err := c2.Send(&control.Hello{
 		Type: control.TypeHello, Version: 1, Mode: "loss",
-		RateBPS: 1_000_000, DurationMS: 100, PacketSize: 64, FlowID: sharedFlow,
+		RateBPS: 1_000_000, DurationMS: 100, PacketSize: 64, FlowID: sharedFlow, Token: 0xABCDEF12,
 	}); err != nil {
 		t.Fatalf("Send 2: %v", err)
 	}
@@ -846,7 +849,7 @@ func TestServeRejectsDuplicateFlowID(t *testing.T) {
 	defer func() { _ = c3.Close() }()
 	if err := c3.Send(&control.Hello{
 		Type: control.TypeHello, Version: 1, Mode: "loss",
-		RateBPS: 1_000_000, DurationMS: 100, PacketSize: 64, FlowID: sharedFlow + 1,
+		RateBPS: 1_000_000, DurationMS: 100, PacketSize: 64, FlowID: sharedFlow + 1, Token: 0xABCDEF12,
 	}); err != nil {
 		t.Fatalf("Send 3: %v", err)
 	}
@@ -895,6 +898,7 @@ func TestServeStatsForwarderBailsOnSendError(t *testing.T) {
 		DurationMS: sessionDurationMS,
 		PacketSize: packetSize,
 		FlowID:     flowID,
+		Token:      0xABCDEF12,
 	}
 	if err := c.Send(hello); err != nil {
 		t.Fatalf("Send hello: %v", err)
@@ -912,7 +916,7 @@ func TestServeStatsForwarderBailsOnSendError(t *testing.T) {
 	buf := make([]byte, packetSize)
 	for i := uint64(0); i < 5; i++ {
 		stream.EncodeHeader(buf, stream.Header{
-			Magic: stream.Magic, FlowID: flowID, Seq: i, TxUnixNS: time.Now().UnixNano(),
+			Magic: stream.Magic, FlowID: flowID, Seq: i, TxUnixNS: time.Now().UnixNano(), Token: 0xABCDEF12,
 		})
 		if _, err := sender.Write(buf); err != nil {
 			t.Fatalf("Write: %v", err)
@@ -924,37 +928,55 @@ func TestServeStatsForwarderBailsOnSendError(t *testing.T) {
 
 	// Slot-release probe: a fresh control session must be admitted
 	// promptly. If the prior session held its slot until DurationMS
-	// (the regression we're guarding against), this Dial+Hello would
-	// either block on Accept or come back with "server busy".
-	dialCtx, dialCancel := context.WithTimeout(ctx, 2*time.Second)
-	defer dialCancel()
-	c2, err := control.Dial(dialCtx, tcpAddr)
-	if err != nil {
-		t.Fatalf("fresh Dial after peer close: %v (elapsed=%s)", err, time.Since(start))
-	}
-	defer func() { _ = c2.Close() }()
-
-	hello2 := *hello
-	hello2.FlowID = 0xC0FFEE43 // distinct from the prior session's flow
-	if err := c2.Send(&hello2); err != nil {
-		t.Fatalf("Send hello2: %v", err)
-	}
-	if err := c2.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
-		t.Fatalf("SetDeadline: %v", err)
-	}
-	msg, err := c2.Recv()
-	if err != nil {
-		t.Fatalf("Recv ready2 after %s: %v", time.Since(start), err)
-	}
-	if e, ok := msg.(*control.Error); ok {
-		t.Fatalf("fresh session rejected after %s: %q (slot did not release)", time.Since(start), e.Reason)
-	}
-	if _, ok := msg.(*control.Ready); !ok {
+	// (the regression we're guarding against), every attempt within the
+	// 3s budget would come back as "server busy". Retry instead of
+	// fatal-fail on the first Error — there is an inherent race between
+	// the client-side close, the server detecting EOF / firing cancel,
+	// handleSession unwinding through receiver+forwarder waits, and the
+	// next session's accept+Hello round-trip. The bound this test
+	// actually guards against is "the slot ever frees within 3s," not
+	// "first c2 attempt is in the lead."
+	deadline := time.Now().Add(3 * time.Second)
+	var lastReason string
+	for time.Now().Before(deadline) {
+		dialCtx, dialCancel := context.WithDeadline(ctx, deadline)
+		c2, err := control.Dial(dialCtx, tcpAddr)
+		dialCancel()
+		if err != nil {
+			t.Fatalf("fresh Dial after peer close: %v (elapsed=%s)", err, time.Since(start))
+		}
+		hello2 := *hello
+		hello2.FlowID = 0xC0FFEE43 // distinct from the prior session's flow
+		if err := c2.Send(&hello2); err != nil {
+			_ = c2.Close()
+			t.Fatalf("Send hello2: %v", err)
+		}
+		if err := c2.SetDeadline(deadline); err != nil {
+			_ = c2.Close()
+			t.Fatalf("SetDeadline: %v", err)
+		}
+		msg, err := c2.Recv()
+		if err != nil {
+			_ = c2.Close()
+			t.Fatalf("Recv ready2 after %s: %v", time.Since(start), err)
+		}
+		if _, ok := msg.(*control.Ready); ok {
+			_ = c2.Close()
+			if elapsed := time.Since(start); elapsed > 3*time.Second {
+				t.Errorf("slot released too slowly: %s", elapsed)
+			}
+			return
+		}
+		if e, ok := msg.(*control.Error); ok {
+			lastReason = e.Reason
+			_ = c2.Close()
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		_ = c2.Close()
 		t.Fatalf("fresh session: expected Ready, got %#v", msg)
 	}
-	if elapsed := time.Since(start); elapsed > 3*time.Second {
-		t.Errorf("slot released too slowly: %s", elapsed)
-	}
+	t.Fatalf("slot did not release within 3s after peer close (last reason: %q)", lastReason)
 }
 
 // TestServeRejectsRateOverCap drives the --max-rate-bps gate end-to-end:
@@ -974,7 +996,7 @@ func TestServeRejectsRateOverCap(t *testing.T) {
 
 	if err := c.Send(&control.Hello{
 		Type: control.TypeHello, Version: 1, Mode: "loss",
-		RateBPS: 10_000_000, DurationMS: 1000, PacketSize: 64, FlowID: 1,
+		RateBPS: 10_000_000, DurationMS: 1000, PacketSize: 64, FlowID: 1, Token: 0xABCDEF12,
 	}); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
@@ -1021,6 +1043,7 @@ func TestServeReverseStreamDisabledByFlag(t *testing.T) {
 		FlowID:        flowID,
 		ReverseStream: "on",
 		ReverseFlowID: reverseFlowID,
+		Token:         0xABCDEF12,
 	}
 	if err := c.Send(hello); err != nil {
 		t.Fatalf("Send hello: %v", err)
@@ -1048,7 +1071,7 @@ func TestServeReverseStreamDisabledByFlag(t *testing.T) {
 	defer func() { _ = sender.Close() }()
 	buf := make([]byte, packetSize)
 	for i := uint64(0); i < 3; i++ {
-		stream.EncodeHeader(buf, stream.Header{Magic: stream.Magic, FlowID: flowID, Seq: i, TxUnixNS: time.Now().UnixNano()})
+		stream.EncodeHeader(buf, stream.Header{Magic: stream.Magic, FlowID: flowID, Seq: i, TxUnixNS: time.Now().UnixNano(), Token: 0xABCDEF12})
 		if _, err := sender.Write(buf); err != nil {
 			t.Fatalf("Write: %v", err)
 		}
@@ -1221,7 +1244,7 @@ func TestServeRejectsProbeWhenNotNegotiated(t *testing.T) {
 	defer func() { _ = c.Close() }()
 	if err := c.Send(&control.Hello{
 		Type: control.TypeHello, Version: 1, Mode: "loss",
-		RateBPS: 1_000_000, DurationMS: 5_000, PacketSize: 64, FlowID: 0xDEADBEEF,
+		RateBPS: 1_000_000, DurationMS: 5_000, PacketSize: 64, FlowID: 0xDEADBEEF, Token: 0xABCDEF12,
 		TCPCorroborate: "off",
 	}); err != nil {
 		t.Fatalf("Send hello: %v", err)
@@ -1284,7 +1307,7 @@ func TestServeProbeTerminatesWithSession(t *testing.T) {
 	const durationMS = 500
 	if err := c.Send(&control.Hello{
 		Type: control.TypeHello, Version: 1, Mode: "loss",
-		RateBPS: 1_000_000, DurationMS: durationMS, PacketSize: 64, FlowID: 0xCAFEBABE,
+		RateBPS: 1_000_000, DurationMS: durationMS, PacketSize: 64, FlowID: 0xCAFEBABE, Token: 0xABCDEF12,
 		TCPCorroborate: "on",
 	}); err != nil {
 		t.Fatalf("Send hello: %v", err)
@@ -1325,5 +1348,135 @@ func TestServeProbeTerminatesWithSession(t *testing.T) {
 	elapsed := time.Since(start)
 	if elapsed > 2*time.Second {
 		t.Fatalf("probe close took %s, expected within ~1s of session end (DurationMS=%dms)", elapsed, durationMS)
+	}
+}
+
+// TestValidateHelloRequiresToken pins finding-8 hardening at the
+// admission boundary: a Hello with Token==0 (pre-feature client, or
+// a token-stripping middlebox) is rejected up front with the documented
+// reason, rather than silently degrading to v1-era integrity.
+func TestValidateHelloRequiresToken(t *testing.T) {
+	h := &control.Hello{
+		Type: control.TypeHello, Version: 1, Mode: "loss",
+		RateBPS: 1_000_000, DurationMS: 1000, PacketSize: 1200, FlowID: 1,
+		// Token deliberately omitted (zero value).
+	}
+	reason := validateHello(h, 0)
+	if !strings.Contains(reason, "token") {
+		t.Fatalf("reason=%q, want substring \"token\"", reason)
+	}
+	// Sanity: same Hello with a non-zero Token passes.
+	h.Token = 0x1
+	if reason := validateHello(h, 0); reason != "" {
+		t.Fatalf("Token=1 rejected: %q", reason)
+	}
+}
+
+// TestServeRejectsProbeFromDifferentIP exercises finding-7's IP-binding
+// gate: a probe dial from a source IP that differs from the control
+// conn's source must be rejected with the documented reason.
+//
+// The test dials the control channel from 127.0.0.1 (default loopback)
+// and the probe from 127.0.0.2. On most platforms 127.0.0.0/8 is wholly
+// loopback so the LocalAddr bind succeeds; if it doesn't, the test
+// skips rather than fail spuriously.
+func TestServeRejectsProbeFromDifferentIP(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tcpAddr, _, teardown := startServer(t, ctx, 0)
+	defer teardown()
+
+	c, err := control.Dial(ctx, tcpAddr)
+	if err != nil {
+		t.Fatalf("Dial control: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	hello := &control.Hello{
+		Type: control.TypeHello, Version: 1, Mode: "loss",
+		RateBPS: 1_000_000, DurationMS: 3_000, PacketSize: 64, FlowID: 0xAA,
+		TCPCorroborate: "on", TCPCorroborateRateBPS: 1_000_000,
+		Token: 0xABCDEF12,
+	}
+	if err := c.Send(hello); err != nil {
+		t.Fatalf("Send hello: %v", err)
+	}
+	ready, err := c.Recv()
+	if err != nil {
+		t.Fatalf("Recv ready: %v", err)
+	}
+	r, ok := ready.(*control.Ready)
+	if !ok {
+		t.Fatalf("expected Ready, got %#v", ready)
+	}
+
+	// Dial probe from 127.0.0.2 — different source IP than control (127.0.0.1).
+	dialer := net.Dialer{
+		LocalAddr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 2)},
+		Timeout:   2 * time.Second,
+	}
+	probeNC, err := dialer.DialContext(ctx, "tcp4", tcpAddr)
+	if err != nil {
+		t.Skipf("cannot bind local 127.0.0.2 on this host: %v", err)
+	}
+	defer func() { _ = probeNC.Close() }()
+
+	if err := control.WriteMessage(probeNC, &control.TCPProbe{
+		Type: control.TypeTCPProbe, SessionID: r.SessionID, RateBPS: 1_000_000,
+	}); err != nil {
+		t.Fatalf("Write probe: %v", err)
+	}
+
+	if err := probeNC.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	msg, err := control.ReadMessage(probeNC)
+	if err != nil {
+		t.Fatalf("ReadMessage: %v", err)
+	}
+	e, ok := msg.(*control.Error)
+	if !ok {
+		t.Fatalf("expected Error, got %#v", msg)
+	}
+	if !strings.Contains(e.Reason, "source IP") {
+		t.Errorf("reason=%q, want substring \"source IP\"", e.Reason)
+	}
+}
+
+// TestRunServerLoopsCapturesFirstErrorOnRace is the regression guard for
+// finding 6: the pre-fix atomic.Value would panic when two goroutines
+// raced to store errors of different concrete types. The post-fix
+// sync.Once path captures the first one and serializes; the test fires
+// both arms with distinct concrete error types and expects no panic and
+// a returned error from {err1, err2}. Run with -race for cross-coverage.
+func TestRunServerLoopsCapturesFirstErrorOnRace(t *testing.T) {
+	err1 := &net.OpError{Op: "read", Err: errors.New("hub-side")}
+	err2 := errors.New("tcp-serve-side") // *errors.errorString — distinct type
+	for i := 0; i < 200; i++ {
+		hubRun := func(context.Context) error { return err1 }
+		tcpServe := func(context.Context) error { return err2 }
+		got := runServerLoops(context.Background(), hubRun, tcpServe)
+		if got == nil {
+			t.Fatalf("iter %d: got nil, want one of {err1, err2}", i)
+		}
+		if got != err1 && got != err2 {
+			t.Fatalf("iter %d: got %v, want one of {err1, err2}", i, got)
+		}
+	}
+}
+
+// TestRunServerLoopsIgnoresContextCanceled pins that a clean shutdown
+// path (both arms returning context.Canceled) yields nil — the
+// non-context-error filter must not promote a Canceled into firstErr.
+func TestRunServerLoopsIgnoresContextCanceled(t *testing.T) {
+	hubRun := func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }
+	tcpServe := func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		cancel()
+	}()
+	if err := runServerLoops(ctx, hubRun, tcpServe); err != nil {
+		t.Fatalf("clean cancel returned err: %v", err)
 	}
 }

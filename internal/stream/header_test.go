@@ -12,7 +12,7 @@ func TestHeaderRoundTrip(t *testing.T) {
 		FlowID:   0xDEADBEEF,
 		Seq:      0x1122334455667788,
 		TxUnixNS: 1_715_000_000_000_000_000,
-		Reserved: 0,
+		Token:    0x99AABBCCDDEEFF00,
 	}
 	buf := make([]byte, HeaderSize)
 	EncodeHeader(buf, h)

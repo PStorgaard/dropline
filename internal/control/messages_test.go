@@ -19,6 +19,7 @@ func TestMessageRoundTrip(t *testing.T) {
 			Type: TypeHello, Version: 1, Mode: "loss", RateBPS: 5_000_000, DurationMS: 60_000,
 			PacketSize: 1200, FlowID: 11, ReverseStream: "auto", ReverseFlowID: 22,
 			TCPCorroborate: "auto", TCPCorroborateRateBPS: 100_000,
+			Token: 0xDEADBEEFCAFEF00D,
 		}},
 		{"ready", &Ready{Type: TypeReady, SessionID: "abc-123"}},
 		{"ready_reverse_stream", &Ready{
@@ -175,10 +176,30 @@ func TestHelloReverseStreamAndTCPOmitemptyZero(t *testing.T) {
 	for _, key := range []string{
 		`"reverse_stream"`, `"reverse_flow_id"`,
 		`"tcp_corroborate"`, `"tcp_corroborate_rate_bps"`,
+		`"token"`,
 	} {
 		if bytes.Contains(raw, []byte(key)) {
 			t.Errorf("zero %s should be omitted; got %s", key, raw)
 		}
+	}
+}
+
+// Hello.Token round-trips through JSON when non-zero.
+func TestHelloTokenRoundTrip(t *testing.T) {
+	in := &Hello{Type: TypeHello, Version: 1, Mode: "loss", RateBPS: 1, DurationMS: 1, PacketSize: 64, FlowID: 1, Token: 0x1122334455667788}
+	raw, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if !bytes.Contains(raw, []byte(`"token":`)) {
+		t.Errorf("missing token key in %s", raw)
+	}
+	var got Hello
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if got.Token != in.Token {
+		t.Errorf("Token round-trip = %#x, want %#x", got.Token, in.Token)
 	}
 }
 

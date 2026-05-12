@@ -342,3 +342,40 @@ func TestSenderWriteTargetUnconnected(t *testing.T) {
 	// other tests in this file; keep go vet quiet.
 	_ = reflect.DeepEqual
 }
+
+// TestSenderStampsToken proves SenderConfig.Token is encoded into every
+// outbound packet header so the receiver / hub can authenticate.
+func TestSenderStampsToken(t *testing.T) {
+	sc, rc := dialedPair(t)
+	const packetSize = 64
+	const token uint64 = 0xABCDEF0123456789
+	s, err := NewSender(sc, SenderConfig{
+		RateBPS:    int64(packetSize * 8 * 100),
+		PacketSize: packetSize,
+		Duration:   100 * time.Millisecond,
+		Token:      token,
+	})
+	if err != nil {
+		t.Fatalf("NewSender: %v", err)
+	}
+	go func() { _ = s.Run(context.Background()) }()
+
+	buf := make([]byte, packetSize)
+	if err := rc.SetReadDeadline(time.Now().Add(300 * time.Millisecond)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	n, _, err := rc.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("ReadFromUDP: %v", err)
+	}
+	if n != packetSize {
+		t.Fatalf("short read: %d", n)
+	}
+	h, err := DecodeHeader(buf[:HeaderSize])
+	if err != nil {
+		t.Fatalf("DecodeHeader: %v", err)
+	}
+	if h.Token != token {
+		t.Errorf("Token = %#x, want %#x", h.Token, token)
+	}
+}

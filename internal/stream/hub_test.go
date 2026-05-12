@@ -34,9 +34,9 @@ func TestHubRoutesByFlowID(t *testing.T) {
 	)
 	rateBPS := int64(packetSize * 8 * pps)
 
-	flowAHandle := hub.Register(flowA, DefaultRingSize, nil)
+	flowAHandle := hub.Register(flowA, DefaultRingSize, nil, 0)
 	defer flowAHandle.Release()
-	flowBHandle := hub.Register(flowB, DefaultRingSize, nil)
+	flowBHandle := hub.Register(flowB, DefaultRingSize, nil, 0)
 	defer flowBHandle.Release()
 
 	dial := func() *net.UDPConn {
@@ -157,7 +157,7 @@ func TestHubRingOverflowAccountsLocalDrops(t *testing.T) {
 
 	const flow uint32 = 0xDEADBEEF
 	const ringSize = 1
-	flowHandle := hub.Register(flow, ringSize, nil)
+	flowHandle := hub.Register(flow, ringSize, nil, 0)
 	defer flowHandle.Release()
 
 	// Send 5 packets without draining the channel — the first will park in
@@ -210,7 +210,7 @@ func TestHubReleaseStopsDelivery(t *testing.T) {
 	go func() { _ = hub.Run(hubCtx) }()
 
 	const flow uint32 = 0xFEEDFACE
-	flowHandle := hub.Register(flow, DefaultRingSize, nil)
+	flowHandle := hub.Register(flow, DefaultRingSize, nil, 0)
 	flowHandle.Release()
 
 	// Channel must already be closed.
@@ -239,13 +239,13 @@ func TestHubTryRegisterCollision(t *testing.T) {
 
 	hub := NewHub(rconn)
 	const flow uint32 = 0x12345678
-	first, ok := hub.TryRegister(flow, DefaultRingSize, nil)
+	first, ok := hub.TryRegister(flow, DefaultRingSize, nil, 0)
 	if !ok || first == nil {
 		t.Fatalf("first TryRegister: got ok=%v handle=%v, want ok=true non-nil", ok, first)
 	}
 	defer first.Release()
 
-	dup, ok := hub.TryRegister(flow, DefaultRingSize, nil)
+	dup, ok := hub.TryRegister(flow, DefaultRingSize, nil, 0)
 	if ok || dup != nil {
 		t.Fatalf("dup TryRegister: got ok=%v handle=%v, want ok=false nil", ok, dup)
 	}
@@ -272,7 +272,7 @@ func TestHubDoubleRegisterPanics(t *testing.T) {
 
 	hub := NewHub(rconn)
 	const flow uint32 = 0xABCD1234
-	first := hub.Register(flow, DefaultRingSize, nil)
+	first := hub.Register(flow, DefaultRingSize, nil, 0)
 	defer first.Release()
 
 	defer func() {
@@ -280,7 +280,7 @@ func TestHubDoubleRegisterPanics(t *testing.T) {
 			t.Error("expected panic on duplicate Register, got nil")
 		}
 	}()
-	_ = hub.Register(flow, DefaultRingSize, nil)
+	_ = hub.Register(flow, DefaultRingSize, nil, 0)
 }
 
 // TestHubFlowRemoteAddrBlocksUntilFirstPacket asserts the contract the
@@ -302,7 +302,7 @@ func TestHubFlowRemoteAddrBlocksUntilFirstPacket(t *testing.T) {
 	go func() { _ = hub.Run(hubCtx) }()
 
 	const flow uint32 = 0xCAFEBABE
-	flowHandle := hub.Register(flow, DefaultRingSize, nil)
+	flowHandle := hub.Register(flow, DefaultRingSize, nil, 0)
 	defer flowHandle.Release()
 
 	// Pre-packet: a short-timeout RemoteAddr should fail with DeadlineExceeded.
@@ -406,7 +406,7 @@ func TestHubReleaseDuringActiveSend(t *testing.T) {
 	// Repeat the register/release cycle several times under load; each
 	// cycle is a fresh chance for the race to fire if the fix regresses.
 	for i := 0; i < 5; i++ {
-		flowHandle := hub.Register(flow, DefaultRingSize, nil)
+		flowHandle := hub.Register(flow, DefaultRingSize, nil, 0)
 
 		sconn, err := net.DialUDP("udp4", nil, addr)
 		if err != nil {
@@ -458,7 +458,7 @@ func TestHubDropsSpoofedSourcePacket(t *testing.T) {
 	go func() { _ = hub.Run(hubCtx) }()
 
 	const flow uint32 = 0x5A150001
-	flowHandle := hub.Register(flow, DefaultRingSize, net.IPv4(127, 0, 0, 2))
+	flowHandle := hub.Register(flow, DefaultRingSize, net.IPv4(127, 0, 0, 2), 0)
 	defer flowHandle.Release()
 
 	sconn, err := net.DialUDP("udp4", nil, addr)
@@ -508,7 +508,7 @@ func TestHubAcceptsMatchingSourcePacket(t *testing.T) {
 	go func() { _ = hub.Run(hubCtx) }()
 
 	const flow uint32 = 0x5A150002
-	flowHandle := hub.Register(flow, DefaultRingSize, net.IPv4(127, 0, 0, 1))
+	flowHandle := hub.Register(flow, DefaultRingSize, net.IPv4(127, 0, 0, 1), 0)
 	defer flowHandle.Release()
 
 	sconn, err := net.DialUDP("udp4", nil, addr)
@@ -553,7 +553,7 @@ func TestHubNilExpectedPeerIPAcceptsAny(t *testing.T) {
 	go func() { _ = hub.Run(hubCtx) }()
 
 	const flow uint32 = 0x5A150003
-	flowHandle := hub.Register(flow, DefaultRingSize, nil)
+	flowHandle := hub.Register(flow, DefaultRingSize, nil, 0)
 	defer flowHandle.Release()
 
 	sconn, err := net.DialUDP("udp4", nil, addr)
@@ -575,5 +575,78 @@ func TestHubNilExpectedPeerIPAcceptsAny(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("packet did not arrive with nil expectedPeerIP")
+	}
+}
+
+// TestHubDropsPacketsWithWrongToken registers a flow with a non-zero
+// expectedToken and confirms a packet stamped with the wrong token is
+// silently dropped — and crucially that captureRemote does NOT fire, so
+// the reverse-direction Sender stays parked rather than latching the
+// forged port.
+func TestHubDropsPacketsWithWrongToken(t *testing.T) {
+	rconn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP: %v", err)
+	}
+	defer func() { _ = rconn.Close() }()
+	addr := rconn.LocalAddr().(*net.UDPAddr)
+
+	hub := NewHub(rconn)
+	hubCtx, hubCancel := context.WithCancel(context.Background())
+	defer hubCancel()
+	go func() { _ = hub.Run(hubCtx) }()
+
+	const flow uint32 = 0x5A150004
+	const expectedToken uint64 = 0xDEADBEEFCAFEF00D
+	flowHandle := hub.Register(flow, DefaultRingSize, nil, expectedToken)
+	defer flowHandle.Release()
+
+	sconn, err := net.DialUDP("udp4", nil, addr)
+	if err != nil {
+		t.Fatalf("DialUDP: %v", err)
+	}
+	defer func() { _ = sconn.Close() }()
+
+	const packetSize = HeaderSize + 32
+	buf := make([]byte, packetSize)
+	// Wrong token in the header.
+	EncodeHeader(buf, Header{Magic: Magic, FlowID: flow, Seq: 0, TxUnixNS: time.Now().UnixNano(), Token: 0x1111111111111111})
+	if _, err := sconn.Write(buf); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	select {
+	case obs, ok := <-flowHandle.Observations():
+		if ok {
+			t.Errorf("wrong-token packet was delivered: %#v", obs)
+		}
+	case <-time.After(200 * time.Millisecond):
+		// expected: packet dropped silently
+	}
+
+	// captureRemote must NOT have fired — the reverse-direction Sender
+	// would otherwise latch onto whatever port the spoofer chose.
+	rctx, rcancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer rcancel()
+	if got, err := flowHandle.RemoteAddr(rctx); err == nil {
+		t.Errorf("RemoteAddr resolved despite token mismatch: got %v", got)
+	}
+
+	// Positive control: now send a packet with the matching token; it
+	// should flow through and resolve RemoteAddr.
+	EncodeHeader(buf, Header{Magic: Magic, FlowID: flow, Seq: 1, TxUnixNS: time.Now().UnixNano(), Token: expectedToken})
+	if _, err := sconn.Write(buf); err != nil {
+		t.Fatalf("Write positive: %v", err)
+	}
+	select {
+	case obs, ok := <-flowHandle.Observations():
+		if !ok {
+			t.Fatal("channel closed before positive observation arrived")
+		}
+		if obs.h.Token != expectedToken {
+			t.Errorf("delivered token = %#x, want %#x", obs.h.Token, expectedToken)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("matching-token packet did not arrive within 1s")
 	}
 }

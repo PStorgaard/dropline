@@ -40,14 +40,21 @@ type Hub struct {
 // flow. nil means "accept any" (test-helper ergonomics). When non-nil
 // the drainer drops any packet whose source IP doesn't match — this is
 // what prevents a spoofed UDP packet from steering the reverse-direction
-// Sender at an arbitrary victim.
+// Sender at an arbitrous victim.
+//
+// expectedToken is the per-session secret carried in every packet header.
+// Zero means "accept any" (same back-compat shape as expectedPeerIP);
+// when non-zero the drainer drops mismatched packets *before*
+// captureRemote so a spoofer who knows only flow_id + source IP can't
+// latch the reverse-direction target onto a forged port.
 type flowQueue struct {
-	ch              chan observation
-	localDrops      atomic.Int64
-	remote          atomic.Pointer[net.UDPAddr]
-	remoteOnce      sync.Once
-	remoteCh        chan struct{}
-	expectedPeerIP  net.IP
+	ch             chan observation
+	localDrops     atomic.Int64
+	remote         atomic.Pointer[net.UDPAddr]
+	remoteOnce     sync.Once
+	remoteCh       chan struct{}
+	expectedPeerIP net.IP
+	expectedToken  uint64
 }
 
 // captureRemote records addr as this flow's first-observed peer the
@@ -133,12 +140,15 @@ func (h *Hub) Run(ctx context.Context) error {
 		h.mu.RLock()
 		if fq, ok := h.flows[hdr.FlowID]; ok {
 			// Drop packets whose UDP source doesn't match the flow's
-			// expected peer IP (nil = accept any, for test ergonomics).
-			// Silent drop: matches the existing "decode failure" style
-			// upstream and keeps the hot path branchless on the steady
-			// state. Must happen before captureRemote so a spoofed
-			// first packet can't latch the wrong reverse target.
-			if fq.expectedPeerIP == nil || addr.IP.Equal(fq.expectedPeerIP) {
+			// expected peer IP (nil = accept any, for test ergonomics)
+			// OR whose Token doesn't match the registered secret
+			// (0 = accept any). Both gates must run before
+			// captureRemote so a spoofed first packet can't latch the
+			// wrong reverse target. Silent drop matches the existing
+			// "decode failure" style upstream.
+			ipOK := fq.expectedPeerIP == nil || addr.IP.Equal(fq.expectedPeerIP)
+			tokOK := fq.expectedToken == 0 || hdr.Token == fq.expectedToken
+			if ipOK && tokOK {
 				fq.captureRemote(addr)
 				select {
 				case fq.ch <- observation{h: hdr, arrival: time.Now()}:
@@ -156,13 +166,15 @@ func (h *Hub) Run(ctx context.Context) error {
 // the per-flow channel and de-registers from the hub. ringSize=0 falls
 // back to DefaultRingSize. expectedPeerIP gates which UDP source the hub
 // will accept for this flow; pass nil to accept any (test helpers only).
+// expectedToken is the per-session secret stamped into every packet by
+// the matched sender; pass 0 to accept any (test helpers only).
 //
 // Panics if flow_id is already registered — the server-side serialization
 // (the control accept path) is responsible for never letting that happen.
 // Callers that handle untrusted flow_ids (e.g. straight from a client
 // Hello) should use TryRegister instead.
-func (h *Hub) Register(flowID uint32, ringSize int, expectedPeerIP net.IP) *HubFlow {
-	hf, ok := h.TryRegister(flowID, ringSize, expectedPeerIP)
+func (h *Hub) Register(flowID uint32, ringSize int, expectedPeerIP net.IP, expectedToken uint64) *HubFlow {
+	hf, ok := h.TryRegister(flowID, ringSize, expectedPeerIP, expectedToken)
 	if !ok {
 		panic("stream: hub flow_id already registered")
 	}
@@ -174,7 +186,7 @@ func (h *Hub) Register(flowID uint32, ringSize int, expectedPeerIP net.IP) *HubF
 // registration untouched. Used by the server's control path, where the
 // flow_id arrives from an untrusted Hello and a collision must surface
 // as a clean Error frame rather than a goroutine panic.
-func (h *Hub) TryRegister(flowID uint32, ringSize int, expectedPeerIP net.IP) (*HubFlow, bool) {
+func (h *Hub) TryRegister(flowID uint32, ringSize int, expectedPeerIP net.IP, expectedToken uint64) (*HubFlow, bool) {
 	if ringSize <= 0 {
 		ringSize = DefaultRingSize
 	}
@@ -193,6 +205,7 @@ func (h *Hub) TryRegister(flowID uint32, ringSize int, expectedPeerIP net.IP) (*
 		ch:             make(chan observation, ringSize),
 		remoteCh:       make(chan struct{}),
 		expectedPeerIP: canonical,
+		expectedToken:  expectedToken,
 	}
 
 	h.mu.Lock()

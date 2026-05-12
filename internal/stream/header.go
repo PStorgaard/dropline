@@ -11,13 +11,20 @@ import (
 //	bytes  4..7   flow_id     u32  randomized per session
 //	bytes  8..15  seq         u64  monotonic, starts at 0
 //	bytes 16..23  tx_unix_ns  i64  sender wall clock at send time
-//	bytes 24..31  reserved    u64  zero in v1
+//	bytes 24..31  token       u64  per-session secret (crypto/rand)
+//
+// Token is the 64-bit secret negotiated over the TCP control channel
+// in Hello.Token. The hub drops any packet whose Token does not match
+// the expected value for the registered flow_id, defeating same-NAT or
+// on-path packet injection that knows only flow_id + source IP.
+// Token=0 is reserved as "no token" for the legacy/test path; the
+// server requires a non-zero token at admission time (validateHello).
 type Header struct {
 	Magic    uint32
 	FlowID   uint32
 	Seq      uint64
 	TxUnixNS int64
-	Reserved uint64
+	Token    uint64
 }
 
 // Magic is the constant first u32 of every loss-test packet ("DRPL").
@@ -40,7 +47,7 @@ func EncodeHeader(buf []byte, h Header) {
 	binary.BigEndian.PutUint32(buf[4:8], h.FlowID)
 	binary.BigEndian.PutUint64(buf[8:16], h.Seq)
 	binary.BigEndian.PutUint64(buf[16:24], uint64(h.TxUnixNS)) // #nosec G115 -- two's-complement reinterpret is intentional
-	binary.BigEndian.PutUint64(buf[24:32], h.Reserved)
+	binary.BigEndian.PutUint64(buf[24:32], h.Token)
 }
 
 // DecodeHeader parses the first HeaderSize bytes of buf into a Header.
@@ -57,7 +64,7 @@ func DecodeHeader(buf []byte) (Header, error) {
 		FlowID:   binary.BigEndian.Uint32(buf[4:8]),
 		Seq:      binary.BigEndian.Uint64(buf[8:16]),
 		TxUnixNS: int64(binary.BigEndian.Uint64(buf[16:24])), // #nosec G115 -- two's-complement reinterpret is intentional
-		Reserved: binary.BigEndian.Uint64(buf[24:32]),
+		Token:    binary.BigEndian.Uint64(buf[24:32]),
 	}
 	if h.Magic != Magic {
 		return Header{}, ErrBadMagic

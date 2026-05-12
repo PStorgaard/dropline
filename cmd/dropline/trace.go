@@ -417,6 +417,16 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 	if err != nil {
 		return fmt.Errorf("mint flow id: %w", err)
 	}
+	// token is the per-session secret stamped into every UDP packet
+	// header (forward AND reverse). The server validates it before
+	// captureRemote so a same-NAT spoofer who knows only flow_id +
+	// source IP can't latch the reverse-direction Sender at a forged
+	// port. 64 bits of crypto/rand is overwhelmingly secure against
+	// blind injection over a 1-hour session ceiling.
+	token, err := mintToken()
+	if err != nil {
+		return fmt.Errorf("mint token: %w", err)
+	}
 	// reverseFlowID is the distinct flow id the server stamps on its
 	// reverse-direction UDP packets. Minted separately and re-minted on
 	// the (astronomically unlikely) collision with the forward flow id
@@ -455,6 +465,7 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 		ReverseFlowID:         reverseFlowID,
 		TCPCorroborate:        cfg.tcpCorroborate.String(),
 		TCPCorroborateRateBPS: tcpCorrRateOnWire,
+		Token:                 token,
 	}
 	if err := cc.Send(hello); err != nil {
 		return fmt.Errorf("send hello: %w", err)
@@ -525,6 +536,7 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 		Duration:   cfg.duration,
 		FlowID:     flowID,
 		Gate:       pauseGate,
+		Token:      token,
 	})
 	if err != nil {
 		return fmt.Errorf("init sender: %w", err)
@@ -587,6 +599,7 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 		reverseSnaps := make(chan stream.Snapshot, 4)
 		reverseRcv, err := stream.NewReceiver(udpConn, stream.ReceiverConfig{
 			FlowID:    reverseFlowID,
+			Token:     token,
 			Tick:      time.Second,
 			Snapshots: reverseSnaps,
 			// No kernel-drop sampler on the client side. The server-side
@@ -1270,4 +1283,19 @@ func mintFlowID() (uint32, error) {
 		id = 1
 	}
 	return id, nil
+}
+
+// mintToken returns a 64-bit per-session secret stamped into every UDP
+// packet header. The server rejects token==0 at admission time, so the
+// (astronomically unlikely) zero draw is replaced with 1.
+func mintToken() (uint64, error) {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return 0, err
+	}
+	t := binary.BigEndian.Uint64(b[:])
+	if t == 0 {
+		t = 1
+	}
+	return t, nil
 }

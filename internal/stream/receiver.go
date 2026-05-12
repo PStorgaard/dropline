@@ -34,6 +34,12 @@ type ReceiverConfig struct {
 	// Packets with a different flow id are silently dropped — they are
 	// neither counted as recv nor as local drops.
 	FlowID uint32
+	// Token, if non-zero, restricts accepted packets to those whose
+	// header Token matches. Direct-conn mode only — the hub-fed path
+	// is already filtered upstream. Zero means "accept any token", to
+	// preserve the back-compat ergonomics that nil expectedPeerIP has
+	// on the hub side.
+	Token uint64
 	// Tick is the periodic snapshot cadence pushed onto Snapshots.
 	// Zero means use DefaultTick; negative means do not emit periodically.
 	Tick time.Duration
@@ -278,6 +284,9 @@ func (r *Receiver) drain(ctx context.Context, ch chan<- observation, wg *sync.Wa
 			continue
 		}
 		if r.cfg.FlowID != 0 && h.FlowID != r.cfg.FlowID {
+			continue
+		}
+		if r.cfg.Token != 0 && h.Token != r.cfg.Token {
 			continue
 		}
 		obs := observation{h: h, arrival: time.Now()}

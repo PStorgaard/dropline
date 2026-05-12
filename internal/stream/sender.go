@@ -41,6 +41,12 @@ type SenderConfig struct {
 	// an unconnected socket would yield EDESTADDRREQ. Constructors of
 	// SenderConfig must pick the right one for the conn they pass.
 	WriteTarget *net.UDPAddr
+	// Token is the 64-bit per-session secret stamped into every
+	// outbound packet header. Zero is the legacy/test "no token" value
+	// — the server-side hub treats expectedToken=0 as "accept any".
+	// Production paths (cmd/dropline/{trace,serve}.go) always pass a
+	// non-zero token; tests and loopback fixtures may omit it.
+	Token uint64
 }
 
 // Sender pushes loss-test UDP packets onto a connected *net.UDPConn at a
@@ -153,6 +159,7 @@ func (s *Sender) Run(ctx context.Context) error {
 			FlowID:   s.flowID,
 			Seq:      seq,
 			TxUnixNS: s.cfg.Now().UnixNano(),
+			Token:    s.cfg.Token,
 		}
 		EncodeHeader(buf, h)
 		copy(buf[HeaderSize:], s.body)

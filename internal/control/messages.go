@@ -88,11 +88,18 @@ type Hello struct {
 	// Empty/absent (old client) → server treats as "off".
 	TCPCorroborate string `json:"tcp_corroborate,omitempty"`
 	// TCPCorroborateRateBPS is the bit-rate the client intends to push on
-	// the corroboration TCP probe. The server doesn't need this value to
-	// function (it just reads-and-discards), but it's included so the
-	// server can reject implausible rates if needed. Zero/absent means
-	// the server-side handler doesn't enforce anything.
+	// the corroboration TCP probe. The server uses it to backpressure the
+	// probe-side reader (slow Read → TCP receive-window closes → sender
+	// throttles) so a peer with a valid session_id can't saturate the
+	// link. Zero/absent disables enforcement (legacy/test path).
 	TCPCorroborateRateBPS int64 `json:"tcp_corroborate_rate_bps,omitempty"`
+	// Token is the 64-bit per-session secret the client mints with
+	// crypto/rand and stamps into every UDP packet header (Header.Token).
+	// The server validates each packet against this value, defeating
+	// same-NAT or on-path injection that knows only flow_id + source IP.
+	// Token=0 is reserved as "no token" and is rejected at admission
+	// time by validateHello.
+	Token uint64 `json:"token,omitempty"`
 }
 
 // Ready acknowledges a Hello and carries the server-assigned session ID.
@@ -255,7 +262,10 @@ type ReverseHopUpdate struct {
 // correlate probe traffic with a session in server-side traces.
 //
 // RateBPS is the bit rate the client intends to push on this probe.
-// The server-side handler doesn't enforce it — the field is advisory.
+// Authoritative enforcement uses the negotiated rate stored in the
+// session registry (from Hello.TCPCorroborateRateBPS) rather than this
+// field; it's preserved on the wire for legacy parsers and operator
+// visibility.
 type TCPProbe struct {
 	Type      Type   `json:"type"`
 	SessionID string `json:"session_id"`
