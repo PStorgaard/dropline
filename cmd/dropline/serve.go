@@ -591,7 +591,9 @@ func startReverseTrace(sessionCtx context.Context, cancel context.CancelFunc, wg
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		_ = prober.Run(sessionCtx)
+		if err := prober.Run(sessionCtx); err != nil {
+			fmt.Fprintf(os.Stderr, "dropline serve: reverse prober: %s\n", err)
+		}
 	}()
 	wg.Add(1)
 	go func() {

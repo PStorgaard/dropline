@@ -561,6 +561,7 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 
 	var workersWG sync.WaitGroup
 	var senderErr error
+	var proberErr error
 	workersWG.Add(1)
 	go func() {
 		defer workersWG.Done()
@@ -568,11 +569,13 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 	}()
 
 	// Prober + snapshot drainer share workerCtx so a single cancel
-	// stops both alongside the sender.
+	// stops both alongside the sender. Both Prober.Run implementations
+	// return nil on ctx cancellation; a non-nil proberErr is always the
+	// "consecutive send blackout" escalation from probe_unix.go.
 	workersWG.Add(1)
 	go func() {
 		defer workersWG.Done()
-		_ = prober.Run(workerCtx)
+		proberErr = prober.Run(workerCtx)
 	}()
 	workersWG.Add(1)
 	go func() {
@@ -789,6 +792,9 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 	}
 	if senderErr != nil && !errors.Is(senderErr, context.Canceled) {
 		fmt.Fprintf(os.Stderr, "dropline trace: sender: %s\n", senderErr)
+	}
+	if proberErr != nil {
+		fmt.Fprintf(os.Stderr, "dropline trace: prober: %s\n", proberErr)
 	}
 
 	// Reuse the report built inside the TUI goroutine when available;

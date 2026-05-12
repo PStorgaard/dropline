@@ -128,11 +128,14 @@ func New(cfg Config, out chan<- Snapshot) (*Prober, error) {
 func (p *Prober) Close() error {
 	var err error
 	p.closeOnce.Do(func() {
-		if p.handle == 0 || p.handle == windows.InvalidHandle {
+		p.mu.Lock()
+		h := p.handle
+		p.handle = windows.InvalidHandle
+		p.mu.Unlock()
+		if h == 0 || h == windows.InvalidHandle {
 			return
 		}
-		r1, _, e := procIcmpCloseHandle.Call(uintptr(p.handle))
-		p.handle = windows.InvalidHandle
+		r1, _, e := procIcmpCloseHandle.Call(uintptr(h))
 		if r1 == 0 {
 			err = e
 		}
@@ -206,7 +209,11 @@ func (p *Prober) sweep() time.Time {
 func (p *Prober) probe(ttl int) {
 	p.mu.Lock()
 	p.hops[ttl-1].sent++
+	handle := p.handle
 	p.mu.Unlock()
+	if handle == 0 || handle == windows.InvalidHandle {
+		return
+	}
 
 	timeoutMS := uint32(lossTimeout(p.cfg.MTRInterval) / time.Millisecond)
 	opts := ipOptionInformation{TTL: uint8(ttl)} // #nosec G115 -- TTL ≤ 255
@@ -219,7 +226,7 @@ func (p *Prober) probe(ttl int) {
 	dest := ipv4ToInAddr(p.cfg.Target)
 
 	r1, _, _ := procIcmpSendEcho2Ex.Call(
-		uintptr(p.handle),
+		uintptr(handle),
 		0, 0, 0, // event, apc routine, apc context
 		0, // source address (0 = let kernel choose)
 		uintptr(dest),
