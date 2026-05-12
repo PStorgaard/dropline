@@ -674,11 +674,14 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 			StartedAt: startedAt,
 			DurationS: f.Stats.DurationS,
 			Config: report.Config{
-				RateBPS:       cfg.rateBPS,
-				PacketSize:    cfg.packetSize,
-				MTRIntervalMS: cfg.mtrInterval.Milliseconds(),
-				MaxHops:       cfg.maxHops,
-				ReverseTrace:  cfg.reverseTrace.String(),
+				RateBPS:               cfg.rateBPS,
+				PacketSize:            cfg.packetSize,
+				MTRIntervalMS:         cfg.mtrInterval.Milliseconds(),
+				MaxHops:               cfg.maxHops,
+				ReverseTrace:          cfg.reverseTrace.String(),
+				ReverseStream:         cfg.reverseStream.String(),
+				TCPCorroborate:        cfg.tcpCorroborate.String(),
+				TCPCorroborateRateBPS: cfg.tcpCorroborateRate,
 			},
 			Stream:            f.Stats,
 			Timeline:          finalState.Buckets,
@@ -1056,6 +1059,14 @@ func startTCPCorroborateProbe(workerCtx context.Context, wg *sync.WaitGroup, cfg
 						// socket has been closed mid-shutdown.
 						return
 					}
+					if !st.Supported {
+						// Local TCP_INFO syscall isn't implemented
+						// (macOS/BSD, pre-Win10-1703). Mark the view
+						// unsupported once and stop polling — further
+						// samples will keep returning zeros.
+						aggregator.MarkTCPCorroborateUnsupported()
+						return
+					}
 					aggregator.IngestTCPInfo(st.BytesRetrans, st.BytesOut, st.RttUs, st.MinRttUs)
 				}
 			}
@@ -1113,12 +1124,16 @@ func reverseStreamReport(v *agg.StreamView, fs *control.FinalStats) *report.Reve
 
 // tcpCorroborateReport builds the renderer's TCP-corroborate view from
 // the aggregator's last-seen sample. Returns nil when the aggregator
-// never saw a sample (probe disabled, or sampler nop on this platform).
+// never saw a sample (probe disabled by config or never started). When
+// the local TCP_INFO syscall is unavailable on this host the view is
+// non-nil with Supported=false so the report can distinguish
+// "unsupported" from "0 retransmits".
 func tcpCorroborateReport(v *agg.TCPCorroborateView) *report.TCPCorroborateReport {
 	if v == nil {
 		return nil
 	}
 	return &report.TCPCorroborateReport{
+		Supported:    v.Supported,
 		BytesRetrans: v.BytesRetrans,
 		BytesOut:     v.BytesOut,
 		RetransPct:   v.RetransPct,

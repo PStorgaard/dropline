@@ -117,8 +117,12 @@ func RenderJSON(w io.Writer, d Data) error {
 	if status == "" {
 		status = control.ReverseStatusDisabledByServer
 	}
+	version := d.Version
+	if version == 0 {
+		version = 1
+	}
 	doc := jsonDoc{
-		Version:           1,
+		Version:           version,
 		Target:            d.Target,
 		StartedAt:         d.StartedAt.UTC().Format(time.RFC3339),
 		DurationS:         d.DurationS,
@@ -180,7 +184,10 @@ func suspectHopsToJSON(src []SuspectHopReport) []jsonSuspectHop {
 
 // hopViewsToJSON converts an agg.HopView slice (from a per-second
 // timeline bucket) into the JSON hop shape. Mirrors hopsToJSON's
-// empty-slice contract for a stable JSON shape.
+// empty-slice contract for a stable JSON shape. Suspect is propagated
+// from the source bucket — Aggregator.MarkSuspects mutates per-bucket
+// hops at end-of-test so timeline rows for suspect TTLs carry the same
+// flag as the overall hop in d.Hops.
 func hopViewsToJSON(src []agg.HopView) []jsonHop {
 	out := make([]jsonHop, len(src))
 	for i, h := range src {
@@ -197,11 +204,7 @@ func hopViewsToJSON(src []agg.HopView) []jsonHop {
 				Avg:    h.AvgRTTMS,
 				StdDev: h.StdDevRTTMS,
 			},
-			// Suspect on per-bucket hops is left false — the suspect
-			// flag attaches to the overall hop in d.Hops, not the
-			// per-bucket snapshot rows. This keeps the timeline a pure
-			// observation log rather than a re-rendering of the verdict.
-			Suspect: false,
+			Suspect: h.Suspect,
 		}
 	}
 	return out

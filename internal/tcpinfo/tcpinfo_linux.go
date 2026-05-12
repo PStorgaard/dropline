@@ -59,6 +59,7 @@ func (s *linuxSampler) Sample() (Stats, error) {
 	// few-MSS overestimate is acceptable.
 	bytesOut := uint64(info.Segs_out) * uint64(info.Snd_mss)
 	return Stats{
+		Supported:    true,
 		BytesRetrans: bytesRetrans,
 		BytesOut:     bytesOut,
 		RttUs:        info.Rtt,

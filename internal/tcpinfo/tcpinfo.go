@@ -25,6 +25,13 @@ package tcpinfo
 // activity happening?" corroboration signal. On Windows BytesRetrans
 // is the kernel's exact byte counter from TCP_INFO_v0.BytesRetrans.
 type Stats struct {
+	// Supported is true when this Stats was filled by an actual
+	// TCP_INFO read; false when the platform/host doesn't expose the
+	// underlying syscall (macOS/BSD fallback, pre-Win10-1703 Windows
+	// after SIO_TCP_INFO returned WSAEINVAL). When false the byte/RTT
+	// fields are all zero and renderers should display "unsupported"
+	// rather than "0 retransmits".
+	Supported bool
 	// BytesRetrans is the cumulative count of bytes the local TCP
 	// stack believes it has retransmitted on this connection.
 	BytesRetrans uint64
@@ -46,18 +53,19 @@ type Stats struct {
 // without touching the connection's data path.
 //
 // On platforms that don't support TCP_INFO retrieval the Sampler is a
-// nopSampler that always returns a zero Stats and a nil error — call
-// sites should check whether all fields are zero if they need to
-// distinguish "unsupported" from "no traffic yet".
+// nopSampler that returns Stats{Supported: false} with nil error — call
+// sites branch on Supported to distinguish "unsupported" from "no
+// retransmits observed".
 type Sampler interface {
 	Sample() (Stats, error)
 	Close() error
 }
 
 // nopSampler is the fallback used on platforms without a TCP_INFO
-// retrieval path. Always returns zero stats and nil error so call
-// sites can stay unconditional.
+// retrieval path. Always returns Stats{Supported: false} and nil error
+// so call sites can stay unconditional and surface "unsupported"
+// distinctly from "zero retransmits".
 type nopSampler struct{}
 
-func (nopSampler) Sample() (Stats, error) { return Stats{}, nil }
+func (nopSampler) Sample() (Stats, error) { return Stats{Supported: false}, nil }
 func (nopSampler) Close() error           { return nil }

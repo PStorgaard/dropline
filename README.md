@@ -66,6 +66,9 @@ dropline trace TARGET
     [--rate 10M] [--duration 60s] [--packet-size 1200]
     [--mtr-interval 1s] [--max-hops 30]
     [--reverse-trace on|off|auto]      (default: auto)
+    [--reverse-stream on|off|auto]     (default: auto)
+    [--tcp-corroborate on|off|auto]    (default: auto)
+    [--tcp-corroborate-rate 100K]      (bps; suffixes K/M/G accepted)
     [--tui | --report | --json]        (default: --tui on a TTY,
                                         --report otherwise)
     [--save FILE]                      (always writes JSON form)
@@ -81,6 +84,14 @@ dropline version
 `--rate` accepts integer bps with optional `K`/`M`/`G` suffix.
 `--max-sessions` caps concurrent client sessions on the server (over-cap
 dials get a clean `server busy` rejection rather than a queue).
+
+`--reverse-stream` enables a server→client UDP loss sub-test that rides
+the same NAT pinhole as the forward stream. `--tcp-corroborate` enables
+a dedicated low-rate TCP probe socket whose `TCP_INFO` retransmit
+counters answer "is the observed UDP loss path-wide, or UDP-specific?"
+— the local sampler is unavailable on macOS/BSD and pre-Win10-1703
+Windows, in which case the report flags the section as `unsupported`
+rather than implying zero retransmits.
 
 ## Linux: systemd
 
@@ -193,18 +204,35 @@ observations, not as halves of one object.
 ends. The authoritative shape lives in `internal/report/json.go`.
 Key fields:
 
-- `target`, `started_at`, `duration_s`, `config`
+- `version`, `target`, `started_at`, `duration_s`
+- `config` — `rate_bps`, `packet_size`, `mtr_interval_ms`, `max_hops`,
+  and the user-chosen mode strings `reverse_trace`, `reverse_stream`,
+  `tcp_corroborate` (each `on`/`off`/`auto`) plus
+  `tcp_corroborate_rate_bps`. The mode strings record what the user
+  asked for; the negotiated outcome surfaces in `reverse_path_status`,
+  the presence/absence of `reverse_stream`, and
+  `tcp_corroborate.supported`
 - `hops[]` — forward path with rolling RTT and per-hop loss%; each
-  entry carries the hop's `ip` address
+  entry carries the hop's `ip` address and a `suspect` flag
 - `reverse_path[]`, `reverse_path_status` — reverse trace from
   server to client (when enabled). `reverse_path[]` is structurally
   identical to `hops[]` modulo two intentional differences: `addr`
   replaces `ip`, and there's no `suspect` flag (the correlator only
   runs against forward-path stream loss)
-- `stream` — sent / recv / loss_pct / jitter / kernel_drops /
-  bursts / rate_tx_bps / rate_rx_bps
+- `stream` — `sent`, `recv`, `loss_pct`, `out_of_order`, `duplicates`,
+  `jitter_ms`, `kernel_drops`, `local_drops` (omitted when zero),
+  `bursts`, `rate_tx_bps`, `rate_rx_bps`
+- `reverse_stream` (when reverse-stream was on) — server-authoritative
+  `sent` plus client-side `recv`, `loss`, `loss_pct`, `out_of_order`,
+  `duplicates`, `jitter_ms`, `local_drops`, `duration_s`
+- `tcp_corroborate` (when tcp-corroborate was on) — `supported`,
+  `bytes_retrans`, `bytes_out`, `retrans_pct`, `rtt_us`, `min_rtt_us`.
+  `supported: false` means the local kernel doesn't expose `TCP_INFO`
+  on this host; the byte/RTT counters are zero in that case and must
+  not be read as "0 retransmits observed"
 - `timeline[]` — per-second buckets with `stream_loss` and a
-  `hops` snapshot of the forward path at that second
+  `hops` snapshot of the forward path at that second; `hops[].suspect`
+  is propagated from the end-of-test correlator verdict
 - `correlation.suspect_hops[]` — `{ttl, confidence, evidence}`,
   ranked descending by confidence; populated when a hop's
   RTT-vs-baseline or per-hop loss spikes co-occur with stream-loss

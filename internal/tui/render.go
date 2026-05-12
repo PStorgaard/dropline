@@ -136,11 +136,18 @@ func renderReverseKPI(view *agg.StreamView, width int) string {
 
 // renderTCPCorroborateKPI is the diagnostic card for the dedicated TCP
 // retransmit probe. Surfaces bytes-out and bytes-retrans plus the
-// derived percentage. Returns "" when view is nil (probe off or nop
-// sampler) so the caller can append unconditionally.
+// derived percentage. Returns "" when view is nil (probe disabled by
+// config or never started) so the caller can append unconditionally.
+// When the local TCP_INFO syscall is unavailable on this host the view
+// is non-nil with Supported=false; we render an "unsupported" body so
+// the operator doesn't read the blank section as "0 retransmits".
 func renderTCPCorroborateKPI(view *agg.TCPCorroborateView, width int) string {
 	if view == nil {
 		return ""
+	}
+	if !view.Supported {
+		return renderSection("tcp corroborate (probe socket)", headerStyle,
+			"unsupported on this host (TCP_INFO unavailable)", width)
 	}
 	pctCell := lossColor(view.RetransPct).Render(fmt.Sprintf("%.3f%%", view.RetransPct))
 	body := fmt.Sprintf("tcp retransmits %d / %d bytes  (%s)",

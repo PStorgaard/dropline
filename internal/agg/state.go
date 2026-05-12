@@ -46,7 +46,14 @@ type StateSnapshot struct {
 // space so internal/tui and internal/report don't import internal/tcpinfo.
 // RetransPct is precomputed for the renderer: BytesRetrans / BytesOut
 // * 100, or 0 when BytesOut is zero.
+//
+// Supported is false when the local TCP_INFO sampler reported the
+// underlying syscall is unavailable on this host (macOS/BSD fallback,
+// pre-Win10-1703 Windows). Renderers branch on Supported so an
+// unsupported host shows "unsupported" rather than misreporting "0
+// retransmits".
 type TCPCorroborateView struct {
+	Supported    bool
 	BytesRetrans uint64
 	BytesOut     uint64
 	RetransPct   float64

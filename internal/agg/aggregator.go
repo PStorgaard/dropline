@@ -151,7 +151,10 @@ func (a *Aggregator) IngestReverseStream(s stream.Snapshot) {
 // IngestTCPInfo records one TCP_INFO sample from the corroboration
 // probe. bytesRetrans / bytesOut are cumulative since the connection
 // was opened; the aggregator publishes them as-is plus a precomputed
-// retransmit fraction so renderers can branch on a single value.
+// retransmit fraction so renderers can branch on a single value. The
+// emitted TCPCorroborateView is always marked Supported=true — callers
+// that learn the local sampler can't read TCP_INFO at all should use
+// MarkTCPCorroborateUnsupported instead.
 //
 // Sends are non-blocking — see IngestStream.
 func (a *Aggregator) IngestTCPInfo(bytesRetrans, bytesOut uint64, rttUs, minRttUs uint32) {
@@ -161,12 +164,29 @@ func (a *Aggregator) IngestTCPInfo(bytesRetrans, bytesOut uint64, rttUs, minRttU
 		pct = float64(bytesRetrans) / float64(bytesOut) * 100
 	}
 	a.lastTCPInfo = &TCPCorroborateView{
+		Supported:    true,
 		BytesRetrans: bytesRetrans,
 		BytesOut:     bytesOut,
 		RetransPct:   pct,
 		RttUs:        rttUs,
 		MinRttUs:     minRttUs,
 	}
+	state := a.snapshotLocked(a.lastTLocked(), a.lastView)
+	a.mu.Unlock()
+	a.emit(state)
+}
+
+// MarkTCPCorroborateUnsupported records that the local TCP_INFO
+// sampler has reported it cannot read per-connection retransmit
+// counters on this host (macOS/BSD fallback, pre-Win10-1703 Windows
+// after WSAEINVAL on SIO_TCP_INFO). The emitted view carries zeroed
+// counters with Supported=false so renderers can show "unsupported"
+// distinctly from "0 retransmits observed".
+//
+// Sends are non-blocking — see IngestStream.
+func (a *Aggregator) MarkTCPCorroborateUnsupported() {
+	a.mu.Lock()
+	a.lastTCPInfo = &TCPCorroborateView{Supported: false}
 	state := a.snapshotLocked(a.lastTLocked(), a.lastView)
 	a.mu.Unlock()
 	a.emit(state)

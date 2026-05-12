@@ -49,8 +49,10 @@ type tcpInfoV0 struct {
 // New returns a Windows Sampler that reads TCP_INFO_v0 via WSAIoctl on
 // conn's underlying SOCKET handle. On the first Sample() failure (the
 // most common cause being a pre-Win10-1703 host that doesn't implement
-// SIO_TCP_INFO), the Sampler silently downgrades to a nopSampler
-// returning zeros — same pattern as kerneldrops_windows.go's
+// SIO_TCP_INFO), the Sampler latches into a disabled state and from
+// then on returns Stats{Supported: false} with nil error — renderers
+// branch on Supported to display "unsupported" rather than "0
+// retransmits". Same pattern as kerneldrops_windows.go's
 // GetUdpStatisticsEx fallback.
 func New(conn *net.TCPConn) (Sampler, error) {
 	if conn == nil {
@@ -63,8 +65,9 @@ type windowsSampler struct {
 	conn *net.TCPConn
 	// disabled flips once a Sample() invocation fails — typically
 	// because the host's Winsock doesn't expose SIO_TCP_INFO. After
-	// that every Sample() returns zero stats with nil error so
-	// renderers can keep treating the section as present-but-empty.
+	// that every Sample() returns Stats{Supported: false} with nil
+	// error so the caller can mark the corroboration view as
+	// unsupported instead of misreporting "0 retransmits".
 	disabled atomic.Bool
 }
 
@@ -73,7 +76,7 @@ type windowsSampler struct {
 // shape.
 func (s *windowsSampler) Sample() (Stats, error) {
 	if s.disabled.Load() {
-		return Stats{}, nil
+		return Stats{Supported: false}, nil
 	}
 	rc, err := s.conn.SyscallConn()
 	if err != nil {
@@ -101,12 +104,14 @@ func (s *windowsSampler) Sample() (Stats, error) {
 	}
 	if sErr != nil {
 		// Most common cause on older hosts: WSAEINVAL because
-		// SIO_TCP_INFO isn't implemented. Downgrade silently — the
-		// rest of dropline keeps working.
+		// SIO_TCP_INFO isn't implemented. Latch the disabled flag and
+		// signal "unsupported" via Stats.Supported=false so renderers
+		// can distinguish this from "0 retransmits observed".
 		s.disabled.Store(true)
-		return Stats{}, nil
+		return Stats{Supported: false}, nil
 	}
 	return Stats{
+		Supported:    true,
 		BytesRetrans: uint64(info.BytesRetrans),
 		BytesOut:     info.BytesOut,
 		RttUs:        info.RttUs,

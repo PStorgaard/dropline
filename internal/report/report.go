@@ -56,7 +56,14 @@ type Data struct {
 // TCPCorroborateReport mirrors agg.TCPCorroborateView in the renderer's
 // type space. All four byte/microsecond counters are kernel-cumulative
 // on the probe socket; RetransPct is precomputed for the renderer.
+//
+// Supported is false when the local TCP_INFO syscall isn't available on
+// this host (macOS/BSD fallback, pre-Win10-1703 Windows). Renderers
+// branch on Supported so the operator-visible output says "unsupported"
+// rather than implying the kernel observed zero retransmits. The
+// byte/RTT fields are all zero when Supported is false.
 type TCPCorroborateReport struct {
+	Supported    bool    `json:"supported"`
 	BytesRetrans uint64  `json:"bytes_retrans"`
 	BytesOut     uint64  `json:"bytes_out"`
 	RetransPct   float64 `json:"retrans_pct"`
@@ -147,15 +154,21 @@ type ReverseHopReport struct {
 	Terminus string
 }
 
-// Config mirrors the JSON `config` block. mtr_interval_ms and max_hops
-// are recorded even though no probe runs yet — the report shape stays
-// stable across slices.
+// Config mirrors the JSON `config` block. The string-valued knobs record
+// the user-chosen mode ("on", "off", or "auto") — not the negotiated
+// outcome, which surfaces elsewhere (reverse_path_status,
+// tcp_corroborate.supported, the presence/absence of reverse_stream).
+// Recording the requested mode is what lets automation distinguish
+// disabled-by-config from unavailable-on-this-host.
 type Config struct {
-	RateBPS       int64  `json:"rate_bps"`
-	PacketSize    int    `json:"packet_size"`
-	MTRIntervalMS int64  `json:"mtr_interval_ms"`
-	MaxHops       int    `json:"max_hops"`
-	ReverseTrace  string `json:"reverse_trace"`
+	RateBPS               int64  `json:"rate_bps"`
+	PacketSize            int    `json:"packet_size"`
+	MTRIntervalMS         int64  `json:"mtr_interval_ms"`
+	MaxHops               int    `json:"max_hops"`
+	ReverseTrace          string `json:"reverse_trace"`
+	ReverseStream         string `json:"reverse_stream"`
+	TCPCorroborate        string `json:"tcp_corroborate"`
+	TCPCorroborateRateBPS int64  `json:"tcp_corroborate_rate_bps"`
 }
 
 // lossPct returns Stream.Loss / (Stream.Recv + Stream.Loss) * 100, or 0

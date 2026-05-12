@@ -61,11 +61,15 @@ func RenderText(w io.Writer, d Data) error {
 
 	if c := d.TCPCorroborate; c != nil {
 		sb.WriteString("\ntcp corroborate (probe socket):\n")
-		fmt.Fprintf(&sb, "  bytes out:    %d\n", c.BytesOut)
-		fmt.Fprintf(&sb, "  bytes retrans:%d (%.3f%%)\n", c.BytesRetrans, c.RetransPct)
-		if c.RttUs > 0 {
-			fmt.Fprintf(&sb, "  rtt:          %.2f ms (min %.2f ms)\n",
-				float64(c.RttUs)/1000.0, float64(c.MinRttUs)/1000.0)
+		if !c.Supported {
+			sb.WriteString("  unsupported on this host (TCP_INFO unavailable)\n")
+		} else {
+			fmt.Fprintf(&sb, "  bytes out:    %d\n", c.BytesOut)
+			fmt.Fprintf(&sb, "  bytes retrans:%d (%.3f%%)\n", c.BytesRetrans, c.RetransPct)
+			if c.RttUs > 0 {
+				fmt.Fprintf(&sb, "  rtt:          %.2f ms (min %.2f ms)\n",
+					float64(c.RttUs)/1000.0, float64(c.MinRttUs)/1000.0)
+			}
 		}
 	}
 
