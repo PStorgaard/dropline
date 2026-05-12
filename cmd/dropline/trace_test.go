@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/PStorgaard/dropline/internal/agg"
 	"github.com/PStorgaard/dropline/internal/control"
 	"github.com/PStorgaard/dropline/internal/report"
 )
@@ -463,5 +464,78 @@ func TestWriteJSONFileAtomicFailureCleansUp(t *testing.T) {
 	}
 	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
 		t.Errorf(".tmp must be cleaned up after failure, stat err=%v", err)
+	}
+}
+
+// Tail-loss case: the receiver never observes a forward seq jump past
+// the last received packet, so v.Lost stays at 0 even though packets
+// were lost. reverseStreamReport must fall back to Sent - Recv.
+func TestReverseStreamReportTailLoss(t *testing.T) {
+	v := &agg.StreamView{Recv: 900, Lost: 0}
+	fs := &control.FinalStats{ReverseSent: 1000, ReverseDurationS: 10.0}
+
+	got := reverseStreamReport(v, fs)
+	if got == nil {
+		t.Fatal("reverseStreamReport returned nil")
+	}
+	if got.Lost != 100 {
+		t.Errorf("Lost: want 100 (Sent-Recv), got %d", got.Lost)
+	}
+	if abs := got.LossPct - 10.0; abs < -1e-6 || abs > 1e-6 {
+		t.Errorf("LossPct: want ~10.0, got %f", got.LossPct)
+	}
+}
+
+// When the receiver's gap-derived Lost exceeds Sent-Recv (e.g. duplicates
+// inflate Recv), the receiver count is authoritative for "loss" — keep it.
+func TestReverseStreamReportPrefersReceiverLost(t *testing.T) {
+	v := &agg.StreamView{Recv: 900, Lost: 120}
+	fs := &control.FinalStats{ReverseSent: 1000, ReverseDurationS: 10.0}
+
+	got := reverseStreamReport(v, fs)
+	if got == nil {
+		t.Fatal("reverseStreamReport returned nil")
+	}
+	if got.Lost != 120 {
+		t.Errorf("Lost: want 120 (receiver gap count, larger than Sent-Recv=100), got %d", got.Lost)
+	}
+	if abs := got.LossPct - 12.0; abs < -1e-6 || abs > 1e-6 {
+		t.Errorf("LossPct: want ~12.0, got %f", got.LossPct)
+	}
+}
+
+// If the receiver view never landed (no reverse packet survived to the
+// stats goroutine) but the server reports Sent > 0, the report must
+// surface 100% loss rather than the silent zero of v == nil.
+func TestReverseStreamReportNilReceiver(t *testing.T) {
+	fs := &control.FinalStats{ReverseSent: 500, ReverseDurationS: 5.0}
+
+	got := reverseStreamReport(nil, fs)
+	if got == nil {
+		t.Fatal("reverseStreamReport returned nil despite ReverseSent > 0")
+	}
+	if got.Lost != 500 {
+		t.Errorf("Lost: want 500 (Sent-Recv with Recv=0), got %d", got.Lost)
+	}
+	if abs := got.LossPct - 100.0; abs < -1e-6 || abs > 1e-6 {
+		t.Errorf("LossPct: want 100.0, got %f", got.LossPct)
+	}
+}
+
+// Clean loopback: Sent == Recv, no receiver-side loss. LossPct must be
+// zero — this guards the cmd/e2e assertion at main.go:281.
+func TestReverseStreamReportCleanLoopback(t *testing.T) {
+	v := &agg.StreamView{Recv: 1000, Lost: 0}
+	fs := &control.FinalStats{ReverseSent: 1000, ReverseDurationS: 10.0}
+
+	got := reverseStreamReport(v, fs)
+	if got == nil {
+		t.Fatal("reverseStreamReport returned nil")
+	}
+	if got.Lost != 0 {
+		t.Errorf("Lost: want 0, got %d", got.Lost)
+	}
+	if got.LossPct != 0 {
+		t.Errorf("LossPct: want 0, got %f", got.LossPct)
 	}
 }

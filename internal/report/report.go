@@ -72,15 +72,18 @@ type ReverseStreamReport struct {
 	// Sent is the server-side exact count of UDP packets transmitted
 	// back to the client (Final.ReverseSent on the wire).
 	Sent int64 `json:"sent"`
-	// Recv, Lost, OutOfOrder, Duplicates are the client's local
-	// observations on the reverse stream.
+	// Recv is the client's local count of reverse-stream packets received.
+	// OutOfOrder and Duplicates are the client's local observations.
 	Recv       int64 `json:"recv"`
+	// Lost is the effective loss count: max(receiverGaps, Sent-Recv, 0).
+	// The receiver only detects loss via a forward seq jump, so tail loss
+	// (the last packets never arriving) leaves the receiver-gap count at
+	// zero; falling back to Sent-Recv recovers the true count.
 	Lost       int64 `json:"loss"`
 	OutOfOrder int64 `json:"out_of_order"`
 	Duplicates int64 `json:"duplicates"`
-	// LossPct = Lost / (Recv + Lost) * 100, or 0 when no traffic. Renderers
-	// fall back to (Sent - Recv) / Sent when Recv + Lost is zero (the
-	// receiver may not have logged Lost yet for very short tests).
+	// LossPct is Lost / Sent * 100 when Sent > 0 (server-authoritative
+	// denominator), else Lost / (Recv + Lost) * 100, else 0.
 	LossPct float64 `json:"loss_pct"`
 	// JitterMS is the RFC 3550 EWMA jitter the client observed.
 	JitterMS float64 `json:"jitter_ms"`

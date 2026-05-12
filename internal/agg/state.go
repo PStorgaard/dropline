@@ -131,8 +131,8 @@ type StreamView struct {
 // recent IngestForwardHop call attributed to this second (last-write-wins
 // at the canonical 1Hz probe cadence).
 type Bucket struct {
-	// T is the integer second index, equal to floor(snapshot.T) at the
-	// time of first observation.
+	// T is the exact integer second index. Buckets in StateSnapshot.Buckets
+	// are sorted by T ascending and each T value is unique.
 	T int
 	// StreamRecv is the count of packets received during this second.
 	StreamRecv int64

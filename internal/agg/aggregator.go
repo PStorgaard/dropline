@@ -101,18 +101,27 @@ func (a *Aggregator) ingestStreamLocked(s stream.Snapshot) StateSnapshot {
 		dRecv = s.Recv - a.last.Recv
 		dLost = s.Lost - a.last.Lost
 		if dRecv < 0 {
+			// Recv is monotonic by construction in stream.Accumulator —
+			// clamp defensively in case a future Reset path violates that.
 			dRecv = 0
-		}
-		if dLost < 0 {
-			dLost = 0
 		}
 	}
 
 	cur := a.bucketAtLocked(bucketIdx)
 	cur.StreamRecv += dRecv
-	cur.StreamLost += dLost
+	if dLost >= 0 {
+		cur.StreamLost += dLost
+	} else {
+		// Lost can decrease when stream.Accumulator records an out-of-order
+		// recovery (a late packet fills a previously-counted gap). Unwind
+		// the correction across recent buckets so per-second StreamLost
+		// stays in sync with the cumulative StreamView.Lost.
+		a.unwindLossLocked(-dLost)
+	}
 	if total := cur.StreamRecv + cur.StreamLost; total > 0 {
 		cur.StreamLossPct = float64(cur.StreamLost) / float64(total) * 100
+	} else {
+		cur.StreamLossPct = 0
 	}
 
 	snap := s
@@ -397,16 +406,69 @@ func (a *Aggregator) snapshotLocked(t float64, stream StreamView) StateSnapshot 
 	}
 }
 
-// bucketAtLocked finds or appends the Bucket whose T == idx. The append
-// branch matches the existing rule: a strictly-greater idx than the
-// current head appends, an equal-or-smaller idx folds into the head.
-// Out-of-order observations (idx < head.T) attribute to the head bucket
-// rather than mutating older history. Caller must hold a.mu.
+// bucketAtLocked finds or inserts the Bucket whose T == idx, keeping
+// a.buckets sorted by T ascending. The hot path is a tail-append: stream
+// snapshots arrive in monotonic T order. An idx older than the head can
+// arise when IngestForwardHop (probe wallclock) races ahead of
+// IngestStream (receiver t0) at a second boundary — in that case we
+// insert at the correct position rather than collapsing into the head,
+// so later stream stats for the older second don't bleed into the
+// newer bucket. Caller must hold a.mu. Returned pointer is valid until
+// the next bucket-mutation call.
 func (a *Aggregator) bucketAtLocked(idx int) *Bucket {
-	if len(a.buckets) == 0 || a.buckets[len(a.buckets)-1].T < idx {
+	n := len(a.buckets)
+	if n == 0 || a.buckets[n-1].T < idx {
 		a.buckets = append(a.buckets, Bucket{T: idx})
+		return &a.buckets[len(a.buckets)-1]
 	}
-	return &a.buckets[len(a.buckets)-1]
+	if a.buckets[n-1].T == idx {
+		return &a.buckets[n-1]
+	}
+	i := sort.Search(n, func(j int) bool { return a.buckets[j].T >= idx })
+	if i < n && a.buckets[i].T == idx {
+		return &a.buckets[i]
+	}
+	a.buckets = append(a.buckets, Bucket{})
+	copy(a.buckets[i+1:], a.buckets[i:])
+	a.buckets[i] = Bucket{T: idx}
+	return &a.buckets[i]
+}
+
+// unwindLossLocked subtracts n from per-bucket StreamLost, walking
+// buckets from highest-T (slice tail) to lowest. Each touched bucket is
+// floored at zero and its StreamLossPct is recomputed. A no-op when n
+// is 0 or a.buckets is empty (which happens if the rollback straddles a
+// Reset). Caller must hold a.mu.
+//
+// Out-of-order recovery in stream.Accumulator decrements `lost` at the
+// arrival time of the late packet, not at the bucket where the original
+// `lost++` happened. At the canonical 1Hz aggregation cadence the
+// receiver's OOO window is small, so newest-first unwind almost always
+// targets the head bucket; the cumulative StreamView.Lost stays exact
+// regardless of which bucket(s) absorb the correction.
+func (a *Aggregator) unwindLossLocked(n int64) {
+	if n <= 0 {
+		return
+	}
+	remaining := n
+	for i := len(a.buckets) - 1; i >= 0 && remaining > 0; i-- {
+		b := &a.buckets[i]
+		if b.StreamLost <= 0 {
+			continue
+		}
+		if b.StreamLost >= remaining {
+			b.StreamLost -= remaining
+			remaining = 0
+		} else {
+			remaining -= b.StreamLost
+			b.StreamLost = 0
+		}
+		if total := b.StreamRecv + b.StreamLost; total > 0 {
+			b.StreamLossPct = float64(b.StreamLost) / float64(total) * 100
+		} else {
+			b.StreamLossPct = 0
+		}
+	}
 }
 
 // lastTLocked returns the elapsed time of the most recent stream snapshot,

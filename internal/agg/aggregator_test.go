@@ -91,6 +91,115 @@ func TestIngestStreamMultipleBuckets(t *testing.T) {
 	}
 }
 
+// When stream.Accumulator decrements cumulative Lost (an out-of-order
+// packet filled a previously-counted gap), the aggregator must roll the
+// correction back through prior buckets so per-second StreamLost stays
+// in sync with the cumulative StreamView.Lost.
+func TestIngestStreamRollbackUnwindsBucket(t *testing.T) {
+	out := make(chan StateSnapshot, 8)
+	a := New(time.Unix(1_000_000_000, 0), out)
+
+	a.IngestStream(stream.Snapshot{T: 0.5, Recv: 100, Lost: 0})
+	a.IngestStream(stream.Snapshot{T: 1.5, Recv: 200, Lost: 3}) // 3 lost in bucket[1]
+	a.IngestStream(stream.Snapshot{T: 2.5, Recv: 300, Lost: 2}) // OOO recovery: lost--
+
+	s := drain(t, out)
+	if len(s.Buckets) != 3 {
+		t.Fatalf("buckets: want 3, got %d", len(s.Buckets))
+	}
+	// bucket[1] originally held lost=3; the rollback of 1 should leave it at 2.
+	if got := s.Buckets[1].StreamLost; got != 2 {
+		t.Errorf("bucket[1].StreamLost after rollback: want 2, got %d", got)
+	}
+	// bucket[2] saw no new loss, so it stays at 0.
+	if got := s.Buckets[2].StreamLost; got != 0 {
+		t.Errorf("bucket[2].StreamLost: want 0, got %d", got)
+	}
+	// Cumulative StreamView matches the latest snapshot exactly.
+	if s.Stream.Lost != 2 {
+		t.Errorf("stream view Lost: want 2, got %d", s.Stream.Lost)
+	}
+	// Total bucket Lost matches cumulative (invariant).
+	var sum int64
+	for _, b := range s.Buckets {
+		sum += b.StreamLost
+	}
+	if sum != s.Stream.Lost {
+		t.Errorf("sum(bucket.Lost)=%d, want %d (== StreamView.Lost)", sum, s.Stream.Lost)
+	}
+}
+
+// A larger rollback than the head bucket holds must walk further back
+// and consume from older buckets, never going negative.
+func TestIngestStreamRollbackSpansMultipleBuckets(t *testing.T) {
+	out := make(chan StateSnapshot, 8)
+	a := New(time.Unix(1_000_000_000, 0), out)
+
+	a.IngestStream(stream.Snapshot{T: 0.5, Recv: 100, Lost: 0})
+	a.IngestStream(stream.Snapshot{T: 1.5, Recv: 200, Lost: 2}) // bucket[1] += 2
+	a.IngestStream(stream.Snapshot{T: 2.5, Recv: 300, Lost: 5}) // bucket[2] += 3
+	a.IngestStream(stream.Snapshot{T: 3.5, Recv: 400, Lost: 1}) // rollback of 4
+
+	s := drain(t, out)
+	if len(s.Buckets) != 4 {
+		t.Fatalf("buckets: want 4, got %d", len(s.Buckets))
+	}
+	// Rollback consumes bucket[2]'s 3 first, then 1 from bucket[1].
+	if got := s.Buckets[2].StreamLost; got != 0 {
+		t.Errorf("bucket[2].StreamLost: want 0 (fully unwound), got %d", got)
+	}
+	if got := s.Buckets[1].StreamLost; got != 1 {
+		t.Errorf("bucket[1].StreamLost: want 1 (partially unwound), got %d", got)
+	}
+	if s.Stream.Lost != 1 {
+		t.Errorf("stream view Lost: want 1, got %d", s.Stream.Lost)
+	}
+}
+
+// IngestForwardHop's bucket index uses the probe's wallclock, distinct
+// from IngestStream's receiver-relative T. A hop snapshot that arrives
+// first at second 2 must not cause a subsequent stream snapshot at
+// second 0 to fold into bucket 2 — it should create its own bucket at
+// the correct sorted position.
+func TestIngestStreamOutOfOrderBucketIdx(t *testing.T) {
+	t0 := time.Unix(1_000_000_000, 0)
+	out := make(chan StateSnapshot, 8)
+	a := New(t0, out)
+
+	// Hop arrives first at elapsed ~2.0s; creates bucket{T:2}.
+	a.IngestForwardHop(probe.Snapshot{
+		At:   t0.Add(2 * time.Second),
+		Hops: []probe.HopStat{{TTL: 1, Addr: "10.0.0.1", Sent: 1, Recv: 1}},
+	})
+	// Now a stream snapshot for second 0 arrives. Must insert a new
+	// bucket{T:0} before the existing bucket{T:2}, not fold into it.
+	a.IngestStream(stream.Snapshot{T: 0.5, Recv: 50, Lost: 1})
+
+	s := drain(t, out)
+	if len(s.Buckets) != 2 {
+		t.Fatalf("buckets: want 2, got %d (%+v)", len(s.Buckets), s.Buckets)
+	}
+	if s.Buckets[0].T != 0 {
+		t.Errorf("buckets[0].T: want 0, got %d", s.Buckets[0].T)
+	}
+	if s.Buckets[1].T != 2 {
+		t.Errorf("buckets[1].T: want 2 (hop bucket preserved), got %d", s.Buckets[1].T)
+	}
+	// Stream data must land in bucket[0], not bucket[1].
+	if s.Buckets[0].StreamRecv != 50 || s.Buckets[0].StreamLost != 1 {
+		t.Errorf("bucket[0] stream stats: want recv=50 lost=1, got recv=%d lost=%d",
+			s.Buckets[0].StreamRecv, s.Buckets[0].StreamLost)
+	}
+	// Hop snapshot must still be at bucket[1].
+	if len(s.Buckets[1].Hops) != 1 {
+		t.Errorf("bucket[1] hops: want 1, got %d", len(s.Buckets[1].Hops))
+	}
+	// And bucket[0] should have no hops (the hop snapshot was for second 2).
+	if len(s.Buckets[0].Hops) != 0 {
+		t.Errorf("bucket[0] hops: want 0, got %d", len(s.Buckets[0].Hops))
+	}
+}
+
 // A slow / blocked consumer must not stall IngestStream. We drive
 // thousands of ingests synchronously into a 1-cap channel and assert
 // total time stays well under any plausible block.

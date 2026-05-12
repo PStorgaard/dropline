@@ -1028,6 +1028,13 @@ func startTCPCorroborateProbe(workerCtx context.Context, wg *sync.WaitGroup, cfg
 // counters in Final.ReverseSent / Final.ReverseDurationS. Returns nil
 // when reverse stream wasn't active for this session — both the
 // aggregator view and Sent are zero.
+//
+// Loss is reported as the effective max of the receiver-observed gap
+// count and the server-reported (Sent - Recv) delta. The receiver only
+// detects loss when a later seq arrives, so tail-loss (the final
+// packets of the test never arriving) leaves v.Lost at zero even when
+// Sent > Recv. Falling back to Sent - Recv recovers the true count.
+// The denominator prefers Sent (server-authoritative) when available.
 func reverseStreamReport(v *agg.StreamView, fs *control.FinalStats) *report.ReverseStreamReport {
 	if v == nil && (fs == nil || (fs.ReverseSent == 0 && fs.ReverseDurationS == 0)) {
 		return nil
@@ -1039,12 +1046,27 @@ func reverseStreamReport(v *agg.StreamView, fs *control.FinalStats) *report.Reve
 	}
 	if v != nil {
 		out.Recv = v.Recv
-		out.Lost = v.Lost
 		out.OutOfOrder = v.OutOfOrder
 		out.Duplicates = v.Duplicates
-		out.LossPct = v.LossPct
 		out.JitterMS = v.JitterMS
 		out.LocalDrops = v.LocalDrops
+	}
+	var effLoss int64
+	if v != nil {
+		effLoss = v.Lost
+	}
+	if gap := out.Sent - out.Recv; gap > effLoss {
+		effLoss = gap
+	}
+	if effLoss < 0 {
+		effLoss = 0
+	}
+	out.Lost = effLoss
+	switch {
+	case out.Sent > 0:
+		out.LossPct = float64(effLoss) / float64(out.Sent) * 100
+	case out.Recv+effLoss > 0:
+		out.LossPct = float64(effLoss) / float64(out.Recv+effLoss) * 100
 	}
 	return &out
 }
