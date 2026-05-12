@@ -123,7 +123,13 @@ func (h *handler) Execute(_ []string, r <-chan svc.ChangeRequest, status chan<- 
 loop:
 	for {
 		select {
-		case req := <-r:
+		case req, ok := <-r:
+			if !ok {
+				// SCM closed the request channel unexpectedly — exit
+				// rather than spin on zero-value receives.
+				cancel()
+				break loop
+			}
 			switch req.Cmd {
 			case svc.Interrogate:
 				status <- req.CurrentStatus

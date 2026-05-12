@@ -31,13 +31,25 @@ type Handler func(ctx context.Context, c *Conn, hello *Hello) error
 type ProbeHandler func(ctx context.Context, nc net.Conn, probe *TCPProbe)
 
 // Server accepts control-channel connections and dispatches each to Handler
-// after parsing the client's Hello. Concurrency caps (e.g. max concurrent
-// sessions) live in the Handler closure — see cmd/dropline/serve.go's
-// newServeHandler — so this package stays free of admission policy.
+// after parsing the client's Hello. Post-Hello admission policy (e.g.
+// max concurrent *sessions*) lives in the Handler closure — see
+// cmd/dropline/serve.go's newServeHandler — because it needs Hello fields
+// (flow_id, etc.). Pre-Hello fd/goroutine caps fundamentally can't live
+// there since the Handler isn't invoked until Hello is parsed; that cap
+// is MaxPendingConns below.
+//
+// MaxPendingConns bounds the number of accepted-but-not-yet-admitted
+// connections (those still in the HelloReadTimeout window or actively
+// running a Handler). Zero means unlimited (test default). When the cap
+// is reached, additional accepted connections are closed immediately
+// without spawning a goroutine or sending a typed Error frame —
+// honest backpressure that doesn't pay Conn-framing setup costs against
+// a flood. Per-IP rate limiting is the next layer and is out of scope.
 type Server struct {
-	Addr         string
-	Handler      Handler
-	ProbeHandler ProbeHandler
+	Addr            string
+	Handler         Handler
+	ProbeHandler    ProbeHandler
+	MaxPendingConns int
 }
 
 // ListenAndServe binds Addr and serves until ctx is canceled. Accept errors
@@ -68,6 +80,14 @@ func (s *Server) serve(ctx context.Context, ln net.Listener) error {
 		<-ctx.Done()
 		_ = ln.Close()
 	}()
+	// Pre-Hello concurrency cap. nil sem == unlimited (back-compat for
+	// tests that construct Server{} without setting MaxPendingConns).
+	// The slot is held for the full handle lifetime; HelloReadTimeout
+	// inside handle bounds the worst-case hold for a slow-loris peer.
+	var sem chan struct{}
+	if s.MaxPendingConns > 0 {
+		sem = make(chan struct{}, s.MaxPendingConns)
+	}
 	var tempDelay time.Duration
 	for {
 		nc, err := ln.Accept()
@@ -97,6 +117,19 @@ func (s *Server) serve(ctx context.Context, ln net.Listener) error {
 			return fmt.Errorf("control: accept: %w", err)
 		}
 		tempDelay = 0
+		if sem != nil {
+			select {
+			case sem <- struct{}{}:
+			default:
+				_ = nc.Close()
+				continue
+			}
+			go func() {
+				defer func() { <-sem }()
+				s.handle(ctx, nc)
+			}()
+			continue
+		}
 		go s.handle(ctx, nc)
 	}
 }

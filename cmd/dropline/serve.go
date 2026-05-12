@@ -164,6 +164,11 @@ func serveRun(ctx context.Context, cfg serveConfig) error {
 	srv := &control.Server{
 		Handler:      newServeHandler(hub, rawICMP.OK, cfg.maxSessions, cfg.maxRateBPS, cfg.allowReverseStream, reg),
 		ProbeHandler: newProbeHandler(reg, cfg.maxSessions),
+		// Cap pre-Hello accepted connections so a TCP flood can't pin
+		// goroutines + fds for HelloReadTimeout each. 8× headroom over
+		// maxSessions tolerates reconnect bursts; --max-sessions defaults
+		// to 4, so the default cap is 32.
+		MaxPendingConns: 8 * cfg.maxSessions,
 	}
 
 	return runServerLoops(ctx,

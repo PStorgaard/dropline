@@ -185,6 +185,77 @@ func TestServerHelloReadTimeoutClosesIdleConn(t *testing.T) {
 	}
 }
 
+// Server must cap the number of accepted-but-not-yet-admitted
+// connections via MaxPendingConns. Beyond the cap, additional accepted
+// conns are closed immediately so a TCP flood cannot pin one goroutine
+// + fd per dangling connection for the full HelloReadTimeout window.
+func TestServerCapsPreHelloConnections(t *testing.T) {
+	prev := HelloReadTimeout
+	HelloReadTimeout = 500 * time.Millisecond
+	t.Cleanup(func() { HelloReadTimeout = prev })
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := &Server{
+		Handler:         func(_ context.Context, _ *Conn, _ *Hello) error { return nil },
+		MaxPendingConns: 2,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = srv.Serve(ctx, ln) }()
+
+	dial := func() net.Conn {
+		nc, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		return nc
+	}
+
+	// Fill both pre-Hello slots and keep them held by sending nothing.
+	c1 := dial()
+	defer c1.Close()
+	c2 := dial()
+	defer c2.Close()
+
+	// Give the accept loop a beat to register both. Without this, the
+	// race between Dial returning and the server's `sem <- struct{}{}`
+	// could leave the third dial racing with c2's slot acquire.
+	time.Sleep(50 * time.Millisecond)
+
+	// Third connect should be accepted-then-closed by the server well
+	// before HelloReadTimeout fires. We verify by reading: a server
+	// close lands as EOF or reset, and it must arrive within a window
+	// much shorter than HelloReadTimeout.
+	c3 := dial()
+	defer c3.Close()
+	rejectDeadline := time.Now().Add(HelloReadTimeout / 2)
+	_ = c3.SetReadDeadline(rejectDeadline)
+	if _, err := c3.Read(make([]byte, 16)); err == nil {
+		t.Fatalf("over-cap conn was not closed; got data instead")
+	}
+	if time.Now().After(rejectDeadline) {
+		t.Fatalf("over-cap conn took too long to close (>=%s); cap not enforced", HelloReadTimeout/2)
+	}
+
+	// Free a slot — closing c1 returns EOF on the server's blocking
+	// read inside handle, which exits and fires the defer that releases
+	// the sem token. EOF is prompt; a short sleep is enough for the
+	// server-side goroutine to unwind.
+	_ = c1.Close()
+	time.Sleep(100 * time.Millisecond)
+	c4 := dial()
+	defer c4.Close()
+	_ = c4.SetReadDeadline(time.Now().Add(HelloReadTimeout / 2))
+	if _, err := c4.Read(make([]byte, 16)); err == nil {
+		t.Fatalf("post-release conn unexpectedly received data")
+	} else if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
+		t.Fatalf("post-release conn closed by server before deadline (slot not freed): %v", err)
+	}
+}
+
 // Conn.Send must not hold writeMu indefinitely when the peer stops
 // reading. With WriteTimeout set short, a stuck reader should cause
 // Send to fail within the timeout window, and a concurrent Send on
