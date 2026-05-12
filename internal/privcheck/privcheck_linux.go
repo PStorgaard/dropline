@@ -14,11 +14,13 @@ import (
 // capNetRaw is the bit position of CAP_NET_RAW in the Linux capability bitmap.
 const capNetRaw = 13
 
-// RawICMP reports whether this process holds CAP_NET_RAW (or is root).
+// RawICMP reports whether this process effectively holds CAP_NET_RAW.
+//
+// Note: euid is NOT a shortcut. Containers and systemd sandboxes can
+// drop CAP_NET_RAW from root via CapabilityBoundingSet / AmbientCaps /
+// k8s securityContext.capabilities.drop, in which case raw ICMP open
+// will fail despite uid 0. Parsing CapEff handles both cases correctly.
 func RawICMP() Status {
-	if os.Geteuid() == 0 {
-		return Status{OK: true}
-	}
 	data, err := os.ReadFile("/proc/self/status")
 	if err != nil {
 		return Status{OK: false, Reason: fmt.Sprintf("unable to read /proc/self/status: %v", err)}

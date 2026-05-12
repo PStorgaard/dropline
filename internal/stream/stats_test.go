@@ -1,6 +1,7 @@
 package stream
 
 import (
+	"math"
 	"testing"
 	"time"
 )
@@ -164,6 +165,51 @@ func TestAccumulatorInitialGap(t *testing.T) {
 	}
 	if s.Bursts.Max != 5 {
 		t.Errorf("max: want 5, got %d", s.Bursts.Max)
+	}
+}
+
+// Header values arriving from the network must not be able to drive the
+// accumulator into negative counters, unbounded memory growth, or NaN-ish
+// jitter. The three tests below pin the defensive bounds in stats.go.
+
+func TestObserve_RejectsSeqAboveMaxInt64(t *testing.T) {
+	t0 := time.Unix(1_000_000_000, 0)
+	a := NewAccumulator(t0)
+	h := Header{Magic: Magic, FlowID: 1, Seq: math.MaxUint64, TxUnixNS: t0.UnixNano()}
+	a.Observe(h, t0.Add(time.Millisecond))
+	s := a.Snapshot(t0.Add(time.Second))
+	if s.Recv != 0 || s.Lost != 0 || s.Duplicates != 0 {
+		t.Fatalf("Seq>MaxInt64 must be silently dropped, got %+v", s)
+	}
+}
+
+func TestObserve_RejectsImplausibleForwardGap(t *testing.T) {
+	t0 := time.Unix(1_000_000_000, 0)
+	a := NewAccumulator(t0)
+	feed(a, t0, 0)
+	// Jump well past the cap.
+	huge := Header{Magic: Magic, FlowID: 1, Seq: maxAcceptableGap + 2, TxUnixNS: t0.Add(time.Millisecond).UnixNano()}
+	a.Observe(huge, t0.Add(2*time.Millisecond))
+	s := a.Snapshot(t0.Add(time.Second))
+	if s.Recv != 1 {
+		t.Fatalf("recv: want 1 (huge gap dropped), got %d", s.Recv)
+	}
+	if s.Lost != 0 {
+		t.Fatalf("lost: want 0 (huge gap dropped before lost++), got %d", s.Lost)
+	}
+}
+
+func TestUpdateJitter_RejectsImplausibleTransit(t *testing.T) {
+	t0 := time.Unix(1_000_000_000, 0)
+	a := NewAccumulator(t0)
+	// First packet establishes baseline transit.
+	a.Observe(Header{Magic: Magic, FlowID: 1, Seq: 0, TxUnixNS: t0.UnixNano()}, t0.Add(time.Millisecond))
+	// Second packet has a TxUnixNS so far from arrival that transit is
+	// well past maxTransitMS — should leave jitter at 0.
+	a.Observe(Header{Magic: Magic, FlowID: 1, Seq: 1, TxUnixNS: 0}, t0.Add(2*time.Millisecond))
+	s := a.Snapshot(t0.Add(time.Second))
+	if s.JitterMS != 0 {
+		t.Fatalf("jitter: want 0 (implausible transit rejected), got %f", s.JitterMS)
 	}
 }
 

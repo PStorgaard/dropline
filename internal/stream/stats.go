@@ -7,6 +7,23 @@ import (
 	"time"
 )
 
+// Defensive bounds on values arriving from the network. The hub's
+// expectedPeerIP gate confines these inputs to the session's own peer,
+// but a misbehaving or buggy peer can still drive the accumulator into
+// negative counters or unbounded memory without these caps.
+const (
+	// maxAcceptableGap is the largest forward seq jump tolerated.
+	// Honest 60s @ 16k pps = 960k; 1<<20 leaves headroom.
+	maxAcceptableGap uint64 = 1 << 20
+	// maxSeenEntries caps the dup-detection map at ~12MB worst case
+	// (256k * 48B/entry). Sessions that hit the cap stop recording new
+	// seqs; existing entries still resolve dup checks correctly.
+	maxSeenEntries = 1 << 18
+	// maxTransitMS bounds plausible one-way transit for jitter math.
+	// Beyond an hour is clock skew or garbage, not transit.
+	maxTransitMS = 60 * 60 * 1000
+)
+
 // BurstBuckets holds the loss-burst histogram counts and max-burst.
 // Buckets per spec § internal/stream: 1, 2, 3-9, 10-99, 100+.
 //
@@ -105,8 +122,25 @@ func (a *Accumulator) Observe(h Header, arrival time.Time) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
+	// Defensive: int64(h.Seq) would go negative for Seq >= 2^63 and
+	// poison Lost/burst accounting; reject before touching state.
+	if h.Seq > math.MaxInt64 {
+		return
+	}
+	// Cap implausible forward jumps so a sparse-seq peer can't push
+	// expectedSeq into nonsense or inflate Lost arbitrarily.
+	if a.seenAny && h.Seq > a.expectedSeq && h.Seq-a.expectedSeq > maxAcceptableGap {
+		return
+	}
+
 	if _, dup := a.seen[h.Seq]; dup {
 		a.duplicates++
+		return
+	}
+	// Cap memory: once the map fills, stop recording new seqs. Real
+	// dups still resolve against existing entries above; the only
+	// degradation is false-negative dup detection past the cap.
+	if len(a.seen) >= maxSeenEntries {
 		return
 	}
 	a.seen[h.Seq] = struct{}{}
@@ -119,13 +153,13 @@ func (a *Accumulator) Observe(h Header, arrival time.Time) {
 		if h.Seq > 0 {
 			// Initial gap from 0..seq-1: record as one burst.
 			a.recordBurst(int64(h.Seq))
-			a.lost += int64(h.Seq) // #nosec G115 -- bounded by sender duration
+			a.lost += int64(h.Seq)
 		}
 	} else if h.Seq >= a.expectedSeq {
 		gap := h.Seq - a.expectedSeq
 		if gap > 0 {
-			a.recordBurst(int64(gap)) // #nosec G115 -- bounded by sender duration
-			a.lost += int64(gap)      // #nosec G115 -- bounded by sender duration
+			a.recordBurst(int64(gap))
+			a.lost += int64(gap)
 		}
 		a.expectedSeq = h.Seq + 1
 		if h.Seq > a.maxSeq {
@@ -149,6 +183,10 @@ func (a *Accumulator) updateJitter(h Header, arrival time.Time) {
 	// in transit between successive packets, so absolute clock skew between
 	// sender and receiver cancels out.
 	transitMS := float64(arrival.UnixNano()-h.TxUnixNS) / 1e6
+	if math.Abs(transitMS) > maxTransitMS {
+		// Implausible clock skew or crafted TxUnixNS; don't poison the EWMA.
+		return
+	}
 	if !a.hasTransit {
 		a.hasTransit = true
 		a.lastTransitMS = transitMS

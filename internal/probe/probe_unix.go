@@ -131,10 +131,18 @@ func (p *Prober) Run(ctx context.Context) error {
 	ticker := time.NewTicker(p.cfg.MTRInterval)
 	defer ticker.Stop()
 
+	// consecBadSweeps tracks sweeps where every send failed. Single
+	// blips are absorbed (the per-hop loss math already represents
+	// them as recv misses); the threshold gates persistent blackout.
+	consecBadSweeps := 0
+
 	// Send the first sweep immediately so the hop table starts filling
 	// before the first ticker fire.
-	at := p.sweep()
+	at, allFailed := p.sweep()
 	p.emit(at)
+	if allFailed {
+		consecBadSweeps++
+	}
 
 	for {
 		select {
@@ -143,8 +151,18 @@ func (p *Prober) Run(ctx context.Context) error {
 			wg.Wait()
 			return nil
 		case <-ticker.C:
-			at := p.sweep()
+			at, allFailed := p.sweep()
 			p.emit(at)
+			if allFailed {
+				consecBadSweeps++
+				if consecBadSweeps > sendErrBackoffThreshold {
+					_ = p.conn.Close()
+					wg.Wait()
+					return fmt.Errorf("probe: %d consecutive sweeps fully failed to send", consecBadSweeps)
+				}
+			} else {
+				consecBadSweeps = 0
+			}
 		}
 	}
 }
@@ -152,9 +170,11 @@ func (p *Prober) Run(ctx context.Context) error {
 // sweep sends one ICMP echo per TTL from 1 up to MaxHops (or the
 // current terminus, whichever is smaller). All probes go out
 // back-to-back; v1 makes no attempt to throttle within a sweep.
-// Returns the moment the sweep began so emit() can stamp the resulting
-// Snapshot with the sweep-start time rather than the post-prune time.
-func (p *Prober) sweep() time.Time {
+// Returns the moment the sweep began (so emit() can stamp the
+// resulting Snapshot with the sweep-start time rather than the
+// post-prune time) and whether every send in the sweep failed
+// (so Run can escalate persistent send blackout).
+func (p *Prober) sweep() (time.Time, bool) {
 	at := time.Now()
 	target := &net.IPAddr{IP: p.cfg.Target}
 	p.mu.Lock()
@@ -163,17 +183,23 @@ func (p *Prober) sweep() time.Time {
 		maxTTL = p.terminus
 	}
 	p.mu.Unlock()
+	failures := 0
 	for ttl := 1; ttl <= maxTTL; ttl++ {
-		p.send(target, ttl)
+		if err := p.send(target, ttl); err != nil {
+			failures++
+		}
 	}
-	return at
+	return at, maxTTL > 0 && failures == maxTTL
 }
 
 // send transmits one ICMP echo with the given TTL, allocates a fresh
 // global seq, and registers the inflight entry. Marshal/SetTTL/WriteTo
-// errors are swallowed — a single bad send shows up as a recv miss in
-// the hop's loss stats and surfaces naturally.
-func (p *Prober) send(target net.Addr, ttl int) {
+// errors are swallowed at the per-probe level — a single bad send
+// shows up as a recv miss in the hop's loss stats and surfaces
+// naturally. The error is *returned* so the sweep can spot the case
+// where every probe fails and Run can escalate that to a fatal exit
+// rather than a silent 100%-loss masquerade.
+func (p *Prober) send(target net.Addr, ttl int) error {
 	p.mu.Lock()
 	seq := p.nextSeq
 	p.nextSeq++
@@ -197,12 +223,15 @@ func (p *Prober) send(target net.Addr, ttl int) {
 	}
 	wb, err := msg.Marshal(nil)
 	if err != nil {
-		return
+		return err
 	}
 	if err := p.pc4.SetTTL(ttl); err != nil {
-		return
+		return err
 	}
-	_, _ = p.conn.WriteTo(wb, target)
+	if _, err := p.conn.WriteTo(wb, target); err != nil {
+		return err
+	}
+	return nil
 }
 
 // recvLoop reads ICMP packets, classifies them, and folds replies into
@@ -282,6 +311,12 @@ func (p *Prober) recvLoop(ctx context.Context) {
 const (
 	recvErrBackoffThreshold = 5
 	recvErrBackoff          = 50 * time.Millisecond
+	// sendErrBackoffThreshold mirrors recvErrBackoffThreshold for the
+	// send side: tolerate transient blips, escalate on persistent
+	// failure. Five fully-failed sweeps at MTRInterval=1s == 5s of
+	// total blackout, which is well beyond any plausible routing
+	// micro-outage and short enough to surface quickly to the caller.
+	sendErrBackoffThreshold = 5
 )
 
 // pruneInflightLocked ages out probes older than cutoff. p.mu must be
