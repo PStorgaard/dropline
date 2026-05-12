@@ -248,7 +248,12 @@ func (m model) View() tea.View {
 		sections = append(sections, renderTCPHopTable(
 			m.latest.LatestForwardTCPHops, m.latest.TCPHopProbePort,
 			m.latest.TCPHopProbeSupported, m.width))
-		if m.latest.TCPHopProbeSupported && len(m.latest.LatestReverseTCPHops) > 0 {
+		// Reverse-table gate is data-presence only: TCPHopProbeSupported
+		// tracks the *forward* prober's platform support (false on
+		// Windows, where probe_tcp_windows.go is a stub). A Linux server
+		// can still send ReverseTCPHopUpdate to a Windows client; don't
+		// let the forward stub's false flag suppress that data.
+		if len(m.latest.LatestReverseTCPHops) > 0 {
 			sections = append(sections, renderReverseTCPHopTable(
 				m.latest.LatestReverseTCPHops, m.latest.TCPHopProbePort, m.width))
 		}

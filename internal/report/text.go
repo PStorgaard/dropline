@@ -207,15 +207,16 @@ func writeSuspectHops(sb *strings.Builder, d Data) {
 // writeTCPHopProbe renders the TCP-mode hop probe section. Mirrors the
 // forward + reverse ICMP sections — same column layout, same loss-cell
 // formatting for silent hops — labeled with the probed destination
-// port. When the platform doesn't support TCP-mode probing (Windows),
-// emits a one-line notice in place of the hop tables.
+// port. Supported tracks the *forward* prober's platform support
+// (false on Windows); when false we emit a one-line notice in place of
+// the forward table but still render the reverse table when the
+// server has populated it — a Windows client paired with a Linux
+// server can receive valid ReverseTCPHopUpdate data.
 func writeTCPHopProbe(sb *strings.Builder, t *TCPHopProbeReport) {
 	fmt.Fprintf(sb, "\ntcp hop probe (port %d):\n", t.Port)
 	if !t.Supported {
-		sb.WriteString("  unsupported on this host (raw-ICMP TCP demux unavailable)\n")
-		return
-	}
-	if len(t.ForwardHops) > 0 {
+		sb.WriteString("  forward: unsupported on this host (raw-ICMP TCP demux unavailable)\n")
+	} else if len(t.ForwardHops) > 0 {
 		sb.WriteString("  forward:\n")
 		fmt.Fprintf(sb, "    %-3s  %-15s  %5s  %5s  %11s  %7s  %7s  %7s  %7s  %7s\n",
 			"TTL", "IP", "Sent", "Recv", "TCP Loss%", "Last", "Best", "Worst", "Avg", "StDev")

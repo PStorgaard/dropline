@@ -60,8 +60,12 @@ type Aggregator struct {
 	// tcpHopProbePort is non-zero once a TCP-mode snapshot has arrived
 	// (carries the probed destination port for renderer labels).
 	tcpHopProbePort uint16
-	// tcpHopProbeSupported tracks the most recent TCP-mode snapshot's
-	// Supported field. False on Windows (stub), true on Linux/macOS.
+	// tcpHopProbeSupported tracks the most recent *forward* TCP-mode
+	// snapshot's Supported field. False on Windows (stub), true on
+	// Linux/macOS. Reverse-direction TCP-hop data is gated on
+	// data presence (len(reverseTCPHops) > 0) rather than this flag —
+	// a Windows client can still receive ReverseTCPHopUpdate from a
+	// Linux server even though its own forward prober is a stub.
 	tcpHopProbeSupported bool
 }
 

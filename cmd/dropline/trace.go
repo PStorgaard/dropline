@@ -188,8 +188,14 @@ func parseTraceArgs(args []string, stdoutIsTTY bool, errOut io.Writer) (traceCon
 	if err != nil {
 		return traceConfig{}, err
 	}
-	if tcpHop == reverseOn && (*tcpHopProbePort < 1 || *tcpHopProbePort > 65535) {
-		return traceConfig{}, fmt.Errorf("--tcp-hop-probe-port must be in [1,65535] when --tcp-hop-probe=on, got %d", *tcpHopProbePort)
+	// Validate unconditionally: the port value lands in traceConfig (and
+	// from there into the saved JSON report's Config block) regardless
+	// of whether the feature is on, so an out-of-range value would
+	// silently wrap to 16 bits via the uint16 cast below and confuse
+	// saved-report consumers. It still doesn't go on the wire unless
+	// --tcp-hop-probe=on (see traceRun's tcpHopProbePortOnWire).
+	if *tcpHopProbePort < 1 || *tcpHopProbePort > 65535 {
+		return traceConfig{}, fmt.Errorf("--tcp-hop-probe-port must be in [1,65535], got %d", *tcpHopProbePort)
 	}
 
 	if *packetSize < 32 {
@@ -223,7 +229,7 @@ func parseTraceArgs(args []string, stdoutIsTTY bool, errOut io.Writer) (traceCon
 		tcpCorroborate:     tcpCorr,
 		tcpCorroborateRate: tcpCorrRate,
 		tcpHopProbe:        tcpHop,
-		tcpHopProbePort:    uint16(*tcpHopProbePort), // #nosec G115 -- bounds-checked above when tcpHop==on
+		tcpHopProbePort:    uint16(*tcpHopProbePort), // #nosec G115 -- bounds-checked above
 	}, nil
 }
 

@@ -346,8 +346,19 @@ func (p *TCPProber) probe(ctx context.Context, ttl int) error {
 		return sockErr
 	}
 
+	// Dial timeout is bounded by MTRInterval (NOT lossTimeout) so a
+	// sweep returns within roughly one tick even when every TTL is
+	// silent/filtered — sweep() wg.Waits on every probe goroutine, so a
+	// 2s lossTimeout floor would halve emit cadence at the default 1s
+	// interval and tank per-bucket correlation. ICMP TimeExceeded
+	// attribution keeps its full lossTimeout window via the inflight
+	// prune in emit(): the dialer cancels the TCP socket early on
+	// timeout, but the inflight entry stays put and recvLoop can still
+	// demux a later TimeExceeded by source port. Tradeoff: paths whose
+	// handshake RTT exceeds MTRInterval miss terminus detection on that
+	// sweep; the next sweep retries.
 	dialer := net.Dialer{
-		Timeout:   lossTimeout(p.cfg.MTRInterval),
+		Timeout:   p.cfg.MTRInterval,
 		LocalAddr: &net.TCPAddr{Port: int(srcPort)},
 		Control:   ctrl,
 	}
@@ -369,9 +380,15 @@ func (p *TCPProber) probe(ctx context.Context, ttl int) error {
 	if isBindCollisionError(err) {
 		// Port collision (another process grabbed our range slot before
 		// we could bind). Roll back so this TTL's sent counter isn't
-		// inflated; next sweep advances the cursor and gets a fresh slot.
+		// inflated; next sweep advances the cursor and gets a fresh
+		// slot. Return the error so sweep() counts this toward
+		// allFailed — a one-off collision among many successful probes
+		// still doesn't escalate (Run's sendErrBackoffThreshold gates
+		// on *consecutive fully-failed* sweeps), but a persistent
+		// blackout where every probe collides surfaces instead of
+		// emitting empty hop tables forever.
 		p.rollbackProbe(srcPort, ttl)
-		return nil
+		return err
 	}
 
 	if isControlSetupError(err) {
