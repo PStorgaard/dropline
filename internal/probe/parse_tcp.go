@@ -36,13 +36,16 @@ type tcpReply struct {
 }
 
 // parseTCPReply classifies an inbound ICMPv4 message for the TCP-mode
-// hop prober. Only TimeExceeded carrying an embedded TCP header is
-// relevant; everything else (EchoReply, destination unreachable, our
-// own ICMP-prober traffic that the kernel also delivered to this raw
-// socket) is ignored. TCP terminus detection happens on the dial side
-// (successful connect or ECONNREFUSED), not via ICMP, so there is no
-// EchoReply analogue here.
-func parseTCPReply(buf []byte, src net.IP) tcpReply {
+// hop prober. Only TimeExceeded (code 0) carrying an embedded TCP
+// header whose inner destination IP and port match this prober's
+// (target, port) is relevant; everything else (EchoReply, destination
+// unreachable, the sibling ICMP prober's traffic that the kernel also
+// delivered to this raw socket, stray TCP flows that happen to alias a
+// source port in our range, fragment-reassembly time-exceeded) is
+// ignored. TCP terminus detection happens on the dial side (successful
+// connect or ECONNREFUSED), not via ICMP, so there is no EchoReply
+// analogue here.
+func parseTCPReply(buf []byte, src net.IP, target net.IP, port uint16) tcpReply {
 	msg, err := icmp.ParseMessage(protocolICMP, buf)
 	if err != nil {
 		return tcpReply{kind: tcpReplyIgnore}
@@ -50,15 +53,24 @@ func parseTCPReply(buf []byte, src net.IP) tcpReply {
 	if msg.Type != ipv4.ICMPTypeTimeExceeded {
 		return tcpReply{kind: tcpReplyIgnore}
 	}
+	// ICMP code 0 is "TTL exceeded in transit" (the only code we care
+	// about). Code 1 is "fragment reassembly time exceeded" — possible
+	// in lossy networks but uninterpretable as a hop result.
+	if msg.Code != 0 {
+		return tcpReply{kind: tcpReplyIgnore}
+	}
 	te, ok := msg.Body.(*icmp.TimeExceeded)
 	if !ok {
 		return tcpReply{kind: tcpReplyIgnore}
 	}
-	port, innerProto, ok := embeddedTCPSrcPort(te.Data)
+	h, innerProto, ok := embeddedTCPHeader(te.Data)
 	if !ok || innerProto != protocolTCP {
 		return tcpReply{kind: tcpReplyIgnore}
 	}
-	return tcpReply{kind: tcpReplyTimeExceeded, srcPort: port, src: src}
+	if !h.dstIP.Equal(target) || h.dstPort != port {
+		return tcpReply{kind: tcpReplyIgnore}
+	}
+	return tcpReply{kind: tcpReplyTimeExceeded, srcPort: h.srcPort, src: src}
 }
 
 // protocolTCP is the IANA protocol number for TCP. Matched against the
@@ -68,28 +80,37 @@ func parseTCPReply(buf []byte, src net.IP) tcpReply {
 // CLAUDE.md note on per-prober raw ICMP sockets).
 const protocolTCP = 6
 
-// embeddedTCPSrcPort parses the data field of a TimeExceeded reply
-// whose inner packet is TCP. Mirrors embeddedEchoIDSeq's IHL math from
-// parse.go: the inner IP header's IHL gives the offset of the inner
-// transport header, the first two bytes of which are the TCP source
-// port (the port we bound on dial; the demux key). innerProto is the
-// inner IP header's Protocol field, returned so the caller can filter
-// out non-TCP TimeExceeded (e.g. the ICMP prober's echoes that this
-// process also receives copies of). RFC 792 guarantees the original IP
-// header plus at least 8 bytes of the original transport header are
-// preserved, which is exactly the 4 bytes (src port + dst port) we
-// need.
-func embeddedTCPSrcPort(data []byte) (srcPort uint16, innerProto uint8, ok bool) {
-	if len(data) < 1 {
-		return 0, 0, false
+// embeddedTCP is the subset of the embedded original IP+TCP header that
+// the TCP prober uses for demux and validation. srcPort is the demux
+// key into p.inflight; dstIP and dstPort are validated against the
+// prober's configured target so stray TCP flows that happen to alias a
+// source port in our range can't mis-attribute hops.
+type embeddedTCP struct {
+	srcPort, dstPort uint16
+	dstIP            net.IP
+}
+
+// embeddedTCPHeader parses the data field of a TimeExceeded reply whose
+// inner packet is TCP. Mirrors embeddedEchoIDSeq's IHL math from
+// parse.go. RFC 792 guarantees the original IP header plus at least 8
+// bytes of the original transport header are preserved; we only need
+// the first 4 bytes of the TCP header (src port + dst port). innerProto
+// is the inner IP header's Protocol field, returned so the caller can
+// filter out non-TCP TimeExceeded.
+func embeddedTCPHeader(data []byte) (h embeddedTCP, innerProto uint8, ok bool) {
+	if len(data) < 20 {
+		return embeddedTCP{}, 0, false
 	}
 	ihl := int(data[0]&0x0f) * 4
 	if ihl < 20 || len(data) < ihl+4 {
-		return 0, 0, false
+		return embeddedTCP{}, 0, false
 	}
-	// IPv4 header byte 9 is the Protocol field.
+	// IPv4 header byte 9 is the Protocol field; bytes 16..19 are the
+	// destination address (the prober's target).
 	innerProto = data[9]
+	h.dstIP = net.IP(append(make([]byte, 0, 4), data[16:20]...))
 	tcpHdr := data[ihl : ihl+4]
-	srcPort = binary.BigEndian.Uint16(tcpHdr[0:2])
-	return srcPort, innerProto, true
+	h.srcPort = binary.BigEndian.Uint16(tcpHdr[0:2])
+	h.dstPort = binary.BigEndian.Uint16(tcpHdr[2:4])
+	return h, innerProto, true
 }

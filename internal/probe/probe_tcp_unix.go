@@ -18,20 +18,35 @@ import (
 )
 
 // tcpProbePortBase is the high-port floor for the TCP prober's
-// source-port allocator. Each TCPProber instance reserves a contiguous
-// slice of size tcpProbeRangeFactor*MaxHops, claimed via the
-// process-global tcpPortCursor. Started at 33434 — the classic
-// UDP-traceroute base — so the range stays clear of common ephemeral
-// allocations and is obvious to an operator eyeballing tcpdump.
+// source-port allocator. Started at 33434 — the classic UDP-traceroute
+// base — so the range stays clear of common ephemeral allocations and is
+// obvious to an operator eyeballing tcpdump.
+//
+// tcpProbeRangeFactor is the *floor* multiplier for the per-prober range
+// size; the actual range scales with the configured loss window so that
+// a slot cannot be reused while a previous probe is still inflight. See
+// computeTCPRangeSize.
 const (
 	tcpProbePortBase    uint32 = 33434
-	tcpProbeRangeFactor uint32 = 4 // range = 4*MaxHops; allows lossTimeout overlap without collision
+	tcpProbeRangeFactor uint32 = 4
 )
 
-// tcpPortCursor walks the process-wide allocator monotonically; each
-// TCPProber claims one slice of size tcpProbeRangeFactor*MaxHops. Wraps
-// modulo the high-port capacity so a long-running server with many
-// sessions doesn't run off the end of the 16-bit port space.
+// tcpPortCapPorts is the number of high ports available to the
+// allocator: from tcpProbePortBase up to the top of the 16-bit space,
+// minus 1024 ports reserved for the kernel's own ephemeral allocations.
+const tcpPortCapPorts uint32 = 65535 - tcpProbePortBase - 1024
+
+// tcpPortCursor counts *port slots* reserved by all TCPProbers in this
+// process; each TCPProber atomically claims a contiguous slice of
+// `rangeSize` slots. Counting slots (not probers) is what makes the
+// per-prober ranges disjoint regardless of how the probers' MaxHops
+// values mix. The cursor wraps modulo tcpPortCapPorts so a long-running
+// server with many sessions doesn't run off the end of the 16-bit port
+// space; on wrap, very-long-lived probers can in principle see range
+// overlap with a freshly-allocated one, but the inflight-aware
+// per-prober allocator (nextSrcPort) makes that overlap self-healing.
+// A future improvement would be an active-reservation table that takes
+// wrap-overlap out of the picture entirely.
 var tcpPortCursor atomic.Uint32
 
 type tcpInflight struct {
@@ -57,10 +72,10 @@ type TCPProber struct {
 	out  chan<- TCPSnapshot
 
 	srcPortBase  uint16
-	srcPortRange uint16
+	srcPortRange uint32 // up to MaxHops(255) * sweepsPerWindow(~21) = 5355; uint16 fits but uint32 keeps the arithmetic noise-free
 
 	mu         sync.Mutex
-	portCursor uint16
+	portCursor uint32
 	inflight   map[uint16]tcpInflight
 	hops       []*hopState
 	terminus   int
@@ -68,20 +83,57 @@ type TCPProber struct {
 	closeOnce sync.Once
 }
 
+// computeTCPRangeSize returns the per-prober source-port reservation
+// width. Sized to ceil(lossTimeout / MTRInterval) + 1 sweeps so a port
+// slot cannot be reused while a previous probe at that slot is still
+// inside the loss window — the precondition the original constant
+// factor of 4 violated for MTRInterval < ~500ms. tcpProbeRangeFactor is
+// the floor so behaviour at the canonical 1s interval is unchanged.
+func computeTCPRangeSize(mtrInterval time.Duration, maxHops int) uint32 {
+	lt := lossTimeout(mtrInterval)
+	sweepsPerWindow := int(lt / mtrInterval)
+	if rem := lt % mtrInterval; rem > 0 {
+		sweepsPerWindow++ // ceil
+	}
+	sweepsPerWindow++ // one sweep of headroom
+	if sweepsPerWindow < int(tcpProbeRangeFactor) {
+		sweepsPerWindow = int(tcpProbeRangeFactor)
+	}
+	r := uint32(maxHops) * uint32(sweepsPerWindow) // #nosec G115 -- maxHops in [1,255]
+	if r == 0 {
+		r = tcpProbeRangeFactor
+	}
+	return r
+}
+
 // nextTCPSrcPortBase reserves a fresh source-port range for a newly
-// constructed TCPProber. Concurrent probers (forward + reverse on a
-// server) get disjoint ranges by virtue of the process-global cursor.
-func nextTCPSrcPortBase(maxHops int) uint16 {
-	rangeSize := uint32(maxHops) * tcpProbeRangeFactor
+// constructed TCPProber. The global cursor counts *port slots* (not
+// probers), so concurrent probers always get disjoint ranges regardless
+// of their MaxHops values. Wrap-safety: if the freshly-claimed slot
+// would straddle the cap, the cursor is advanced to the next aligned
+// multiple of the cap before returning, so each prober owns one
+// contiguous slice.
+func nextTCPSrcPortBase(rangeSize uint32) uint16 {
 	if rangeSize == 0 {
 		rangeSize = tcpProbeRangeFactor
 	}
-	// Keep 1024 ports clear at the top of the 16-bit space for the
-	// kernel's own ephemeral allocations.
-	const cap = 65535 - tcpProbePortBase - 1024
-	cursor := tcpPortCursor.Add(1) - 1
-	offset := (cursor * rangeSize) % cap
-	return uint16(tcpProbePortBase + offset) // #nosec G115 -- value is bounded by cap < 65535
+	// CAS loop so the wrap-realignment branch reserves the right amount
+	// of cursor space atomically with the slot claim.
+	for {
+		cur := tcpPortCursor.Load()
+		offset := cur % tcpPortCapPorts
+		next := cur + rangeSize
+		if offset+rangeSize > tcpPortCapPorts {
+			// Straddles the wrap boundary — jump to the next aligned
+			// multiple so the returned slice is contiguous.
+			alignedBase := (cur/tcpPortCapPorts + 1) * tcpPortCapPorts
+			offset = 0
+			next = alignedBase + rangeSize
+		}
+		if tcpPortCursor.CompareAndSwap(cur, next) {
+			return uint16(tcpProbePortBase + offset) // #nosec G115 -- offset < tcpPortCapPorts
+		}
+	}
 }
 
 // NewTCP opens the dedicated raw ICMPv4 socket and prepares per-hop
@@ -117,13 +169,13 @@ func NewTCP(cfg TCPConfig, out chan<- TCPSnapshot) (*TCPProber, error) {
 		hops[i] = &hopState{}
 	}
 
-	rangeSize := uint32(cfg.MaxHops) * tcpProbeRangeFactor
+	rangeSize := computeTCPRangeSize(cfg.MTRInterval, cfg.MaxHops)
 	return &TCPProber{
 		cfg:          cfg,
 		conn:         conn,
 		out:          out,
-		srcPortBase:  nextTCPSrcPortBase(cfg.MaxHops),
-		srcPortRange: uint16(rangeSize), // #nosec G115 -- rangeSize <= 255*4 = 1020
+		srcPortBase:  nextTCPSrcPortBase(rangeSize),
+		srcPortRange: rangeSize,
 		inflight:     make(map[uint16]tcpInflight),
 		hops:         hops,
 	}, nil
@@ -226,15 +278,25 @@ func (p *TCPProber) sweep(ctx context.Context) (time.Time, bool) {
 }
 
 // nextSrcPort allocates the next port slot from the prober's reserved
-// range, wrapping monotonically. The range is sized to 4*MaxHops so a
-// previously-used port's inflight entry has fully expired (via
-// lossTimeout) before the slot is reused — see CLAUDE.md.
-func (p *TCPProber) nextSrcPort() uint16 {
+// range, walking monotonically. Slots that are still in p.inflight are
+// skipped: the range is sized so a slot is fresh by the time the cursor
+// comes around (computeTCPRangeSize), but a still-inflight entry would
+// indicate a path slower than the loss window, and overwriting it would
+// leak the old hop's inflight counter (silently understating loss).
+// Returns ok=false only if every slot in the range is currently
+// inflight, which the range sizing rules out in practice; the guard is
+// there so the loop is bounded.
+func (p *TCPProber) nextSrcPort() (uint16, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	port := p.srcPortBase + (p.portCursor % p.srcPortRange)
-	p.portCursor++
-	return port
+	for tried := uint32(0); tried < p.srcPortRange; tried++ {
+		port := uint16(uint32(p.srcPortBase) + (p.portCursor % p.srcPortRange)) // #nosec G115 -- bounded
+		p.portCursor++
+		if _, busy := p.inflight[port]; !busy {
+			return port, true
+		}
+	}
+	return 0, false
 }
 
 // probe sends one TCP SYN at the given TTL and folds the outcome into
@@ -248,7 +310,13 @@ func (p *TCPProber) nextSrcPort() uint16 {
 // on the wire) — those bubble up so sweep can escalate persistent
 // platform issues like IP_TTL being rejected.
 func (p *TCPProber) probe(ctx context.Context, ttl int) error {
-	srcPort := p.nextSrcPort()
+	srcPort, ok := p.nextSrcPort()
+	if !ok {
+		// Allocator exhausted: every slot in the range is currently
+		// inflight. Skip this TTL for this sweep — no send goes out, no
+		// counters change, so the loss denominator stays honest.
+		return nil
+	}
 	sentAt := time.Now()
 
 	p.mu.Lock()
@@ -445,7 +513,7 @@ func (p *TCPProber) recvLoop(ctx context.Context) {
 			src = a.IP
 		}
 		now := time.Now()
-		r := parseTCPReply(buf[:n], src)
+		r := parseTCPReply(buf[:n], src, p.cfg.Target, p.cfg.Port)
 		if r.kind == tcpReplyIgnore {
 			continue
 		}
