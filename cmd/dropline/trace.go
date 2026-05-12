@@ -618,9 +618,7 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 	// client side. On dial / send failure we log and skip — the rest
 	// of the test keeps running.
 	if tcpCorroborateOn && cfg.tcpCorroborateRate > 0 {
-		if err := startTCPCorroborateProbe(workerCtx, &workersWG, cfg, sessionID, aggregator); err != nil {
-			fmt.Fprintf(os.Stderr, "dropline trace: tcp-corroborate skipped: %s\n", err)
-		}
+		startTCPCorroborateProbe(workerCtx, &workersWG, cfg, sessionID, aggregator)
 	}
 
 	var (
@@ -935,92 +933,107 @@ func hopsFromAgg(in []agg.HopView) []report.HopReport {
 // the dropline server port, sends the TCPProbe handshake, and spawns
 // (a) a low-rate writer that keeps the kernel busy enough to retransmit
 // when the path drops bytes, and (b) a 1Hz sampler that reads TCP_INFO
-// and forwards it to the aggregator. Both goroutines are bound to
-// workerCtx via the supplied WaitGroup so the trace driver's shutdown
-// path picks them up alongside the other workers.
-func startTCPCorroborateProbe(workerCtx context.Context, wg *sync.WaitGroup, cfg traceConfig, sessionID string, aggregator *agg.Aggregator) error {
-	tcpAddr, err := net.ResolveTCPAddr("tcp4", cfg.target)
-	if err != nil {
-		return fmt.Errorf("resolve tcp: %w", err)
-	}
-	probeConn, err := net.DialTCP("tcp4", nil, tcpAddr)
-	if err != nil {
-		return fmt.Errorf("dial tcp: %w", err)
-	}
-	if err := control.WriteMessage(probeConn, &control.TCPProbe{
-		Type:      control.TypeTCPProbe,
-		SessionID: sessionID,
-		RateBPS:   cfg.tcpCorroborateRate,
-	}); err != nil {
-		_ = probeConn.Close()
-		return fmt.Errorf("send tcp_probe: %w", err)
-	}
-	sampler, err := tcpinfo.New(probeConn)
-	if err != nil {
-		_ = probeConn.Close()
-		return fmt.Errorf("init tcpinfo sampler: %w", err)
-	}
-
-	// Close the probe socket when workerCtx fires so the writer
-	// goroutine's blocking Write returns and the sampler goroutine
-	// exits cleanly via the ticker case.
+// and forwards it to the aggregator. Dial + handshake run inside an
+// outer goroutine bound to workerCtx so a stalled second TCP dial
+// cannot block trace startup; tcp-corroborate is a best-effort
+// sub-feature and any setup failure is logged to stderr without
+// affecting the rest of the test. All inner goroutines ride the
+// supplied WaitGroup so the trace driver's shutdown path picks them
+// up alongside the other workers.
+func startTCPCorroborateProbe(workerCtx context.Context, wg *sync.WaitGroup, cfg traceConfig, sessionID string, aggregator *agg.Aggregator) {
+	// wg.Add for the outer goroutine happens *before* `go` so a parent
+	// Wait can't race past us.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		<-workerCtx.Done()
-		_ = probeConn.Close()
-	}()
-
-	// Writer: emit fixed-size chunks at a 10Hz cadence to hit the
-	// configured rate. The chunk size is chosen so even a 100kbps probe
-	// produces enough TCP segments (10 chunks/sec × ~1250 bytes ≈ a few
-	// MSS-sized segments) to be a meaningful retransmit canary.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		const ticksPerSec = 10
-		bytesPerTick := int(cfg.tcpCorroborateRate / 8 / ticksPerSec)
-		if bytesPerTick < 64 {
-			bytesPerTick = 64
+		dialer := net.Dialer{Timeout: 3 * time.Second}
+		conn, err := dialer.DialContext(workerCtx, "tcp4", cfg.target)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "dropline trace: tcp-corroborate dial: %s\n", err)
+			return
 		}
-		buf := make([]byte, bytesPerTick)
-		tk := time.NewTicker(time.Second / ticksPerSec)
-		defer tk.Stop()
-		for {
-			select {
-			case <-workerCtx.Done():
-				return
-			case <-tk.C:
-				if _, err := probeConn.Write(buf); err != nil {
+		probeConn, ok := conn.(*net.TCPConn)
+		if !ok {
+			_ = conn.Close()
+			fmt.Fprintf(os.Stderr, "dropline trace: tcp-corroborate: dial returned non-TCP conn\n")
+			return
+		}
+		if err := control.WriteMessage(probeConn, &control.TCPProbe{
+			Type:      control.TypeTCPProbe,
+			SessionID: sessionID,
+			RateBPS:   cfg.tcpCorroborateRate,
+		}); err != nil {
+			_ = probeConn.Close()
+			fmt.Fprintf(os.Stderr, "dropline trace: tcp-corroborate send: %s\n", err)
+			return
+		}
+		sampler, err := tcpinfo.New(probeConn)
+		if err != nil {
+			_ = probeConn.Close()
+			fmt.Fprintf(os.Stderr, "dropline trace: tcp-corroborate sampler: %s\n", err)
+			return
+		}
+
+		// Close the probe socket when workerCtx fires so the writer
+		// goroutine's blocking Write returns and the sampler goroutine
+		// exits cleanly via the ticker case.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-workerCtx.Done()
+			_ = probeConn.Close()
+		}()
+
+		// Writer: emit fixed-size chunks at a 10Hz cadence to hit the
+		// configured rate. The chunk size is chosen so even a 100kbps probe
+		// produces enough TCP segments (10 chunks/sec × ~1250 bytes ≈ a few
+		// MSS-sized segments) to be a meaningful retransmit canary.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			const ticksPerSec = 10
+			bytesPerTick := int(cfg.tcpCorroborateRate / 8 / ticksPerSec)
+			if bytesPerTick < 64 {
+				bytesPerTick = 64
+			}
+			buf := make([]byte, bytesPerTick)
+			tk := time.NewTicker(time.Second / ticksPerSec)
+			defer tk.Stop()
+			for {
+				select {
+				case <-workerCtx.Done():
 					return
+				case <-tk.C:
+					if _, err := probeConn.Write(buf); err != nil {
+						return
+					}
 				}
 			}
-		}
-	}()
+		}()
 
-	// Sampler: poll TCP_INFO every second; push results to aggregator.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		defer func() { _ = sampler.Close() }()
-		tk := time.NewTicker(time.Second)
-		defer tk.Stop()
-		for {
-			select {
-			case <-workerCtx.Done():
-				return
-			case <-tk.C:
-				st, err := sampler.Sample()
-				if err != nil {
-					// Stop polling on first error — typically the
-					// socket has been closed mid-shutdown.
+		// Sampler: poll TCP_INFO every second; push results to aggregator.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { _ = sampler.Close() }()
+			tk := time.NewTicker(time.Second)
+			defer tk.Stop()
+			for {
+				select {
+				case <-workerCtx.Done():
 					return
+				case <-tk.C:
+					st, err := sampler.Sample()
+					if err != nil {
+						// Stop polling on first error — typically the
+						// socket has been closed mid-shutdown.
+						return
+					}
+					aggregator.IngestTCPInfo(st.BytesRetrans, st.BytesOut, st.RttUs, st.MinRttUs)
 				}
-				aggregator.IngestTCPInfo(st.BytesRetrans, st.BytesOut, st.RttUs, st.MinRttUs)
 			}
-		}
+		}()
 	}()
-	return nil
 }
 
 // reverseStreamReport builds the renderer's reverse-stream view from the

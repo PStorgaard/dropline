@@ -845,25 +845,30 @@ func TestServeRejectsDuplicateFlowID(t *testing.T) {
 
 // A peer that aborts its read side after Ready should not cause the
 // server's session to drag out for the full DurationMS. The stats
-// forwarder must exit on the first Send error and let sessionCtx tear
-// the rest down promptly.
+// forwarder must exit on the first Send error and call cancel() so
+// sessionCtx tears the rest down and the maxSessions slot frees
+// promptly. Verified directly via the slot-release probe: a fresh
+// session must be admitted well before DurationMS expires.
 func TestServeStatsForwarderBailsOnSendError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	tcpAddr, udpAddr, teardown := startServer(t, ctx, 0)
+	// maxSessions=1 — the only direct way to observe slot release is a
+	// fresh Hello succeeding immediately after the prior session ends.
+	tcpAddr, udpAddr, teardown := startServer(t, ctx, 1)
 	defer teardown()
 
 	c, err := control.Dial(ctx, tcpAddr)
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
-	// Note: NOT deferring Close — we close it explicitly below to trigger
-	// the send-error path while the session is mid-test.
+	// Not deferring Close — we close it explicitly below to trigger
+	// the send-error / recv-EOF path while the session is mid-test.
 
 	const flowID uint32 = 0xC0FFEE42
 	const packetSize = 64
-	// Pick DurationMS big enough that the test would visibly hang if the
-	// forwarder didn't bail; small enough to not slow the suite if it does.
+	// DurationMS large enough that, if the slot weren't released, the
+	// fresh Hello below would block for the full duration; small enough
+	// to bound test runtime when the fix regresses.
 	const sessionDurationMS = 15_000
 	hello := &control.Hello{
 		Type: control.TypeHello, Version: 1, Mode: "loss",
@@ -895,35 +900,41 @@ func TestServeStatsForwarderBailsOnSendError(t *testing.T) {
 		}
 	}
 
-	// Kill the control TCP read side. The server's next c.Send returns an
-	// error; the forwarder logs and returns; the recv watcher's Recv
-	// returns; sessionCtx cancels; rcv.Run unwinds; handleSession returns.
-	// All of that must happen well inside the 15s DurationMS.
 	start := time.Now()
 	_ = c.Close()
 
-	// Poll for the session to finish via the server's listener slot
-	// freeing up. The simplest proxy: a fresh Dial+Hello with a different
-	// flow_id should complete promptly. If the prior session were stuck
-	// honoring DurationMS, this would still succeed (max-sessions=4), so
-	// instead we check that the elapsed time stays well under DurationMS
-	// by counting active goroutines settling.
-	//
-	// More direct: just wait up to 5s and assert the test wall-clock is
-	// well below DurationMS. If the forwarder still wedged the session,
-	// the server would log per-tick errors for ~15s.
-	deadline := start.Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		time.Sleep(100 * time.Millisecond)
-		// No public hook for "session count" — settle via wall-clock
-		// budget. The point is: nothing about this test should depend on
-		// DurationMS; the forwarder bailing makes the cleanup prompt.
-		if time.Since(start) > 3*time.Second {
-			break
-		}
+	// Slot-release probe: a fresh control session must be admitted
+	// promptly. If the prior session held its slot until DurationMS
+	// (the regression we're guarding against), this Dial+Hello would
+	// either block on Accept or come back with "server busy".
+	dialCtx, dialCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer dialCancel()
+	c2, err := control.Dial(dialCtx, tcpAddr)
+	if err != nil {
+		t.Fatalf("fresh Dial after peer close: %v (elapsed=%s)", err, time.Since(start))
 	}
-	if elapsed := time.Since(start); elapsed >= time.Duration(sessionDurationMS)*time.Millisecond {
-		t.Errorf("session did not clean up promptly after peer closed: elapsed=%s, DurationMS=%dms", elapsed, sessionDurationMS)
+	defer func() { _ = c2.Close() }()
+
+	hello2 := *hello
+	hello2.FlowID = 0xC0FFEE43 // distinct from the prior session's flow
+	if err := c2.Send(&hello2); err != nil {
+		t.Fatalf("Send hello2: %v", err)
+	}
+	if err := c2.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("SetDeadline: %v", err)
+	}
+	msg, err := c2.Recv()
+	if err != nil {
+		t.Fatalf("Recv ready2 after %s: %v", time.Since(start), err)
+	}
+	if e, ok := msg.(*control.Error); ok {
+		t.Fatalf("fresh session rejected after %s: %q (slot did not release)", time.Since(start), e.Reason)
+	}
+	if _, ok := msg.(*control.Ready); !ok {
+		t.Fatalf("fresh session: expected Ready, got %#v", msg)
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Errorf("slot released too slowly: %s", elapsed)
 	}
 }
 
@@ -1171,4 +1182,129 @@ func TestRunServerLoopsCoordinatedShutdown(t *testing.T) {
 			t.Fatal("hub loop was not cancelled by tcp failure")
 		}
 	})
+}
+
+// A TCP probe connection targeting a live session that negotiated
+// tcp_corroborate="off" must be rejected with a "not negotiated" Error,
+// independent of whether the SessionID matches a live session. This
+// guards the fix for defect 10b: per-session policy is the source of
+// truth, not just the existence of an active session_id.
+func TestServeRejectsProbeWhenNotNegotiated(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tcpAddr, _, teardown := startServer(t, ctx, 0)
+	defer teardown()
+
+	c, err := control.Dial(ctx, tcpAddr)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	if err := c.Send(&control.Hello{
+		Type: control.TypeHello, Version: 1, Mode: "loss",
+		RateBPS: 1_000_000, DurationMS: 5_000, PacketSize: 64, FlowID: 0xDEADBEEF,
+		TCPCorroborate: "off",
+	}); err != nil {
+		t.Fatalf("Send hello: %v", err)
+	}
+	msg, err := c.Recv()
+	if err != nil {
+		t.Fatalf("Recv ready: %v", err)
+	}
+	ready, ok := msg.(*control.Ready)
+	if !ok {
+		t.Fatalf("expected Ready, got %#v", msg)
+	}
+	if ready.TCPCorroborate != "off" {
+		t.Fatalf("server resolved TCPCorroborate=%q, want \"off\"", ready.TCPCorroborate)
+	}
+	sid := ready.SessionID
+
+	// Open the second TCP — the would-be probe — directly via net.Dial,
+	// since this is exercising the server's probe-dispatch path, not the
+	// client wrapper.
+	probeNC, err := net.Dial("tcp4", tcpAddr)
+	if err != nil {
+		t.Fatalf("probe Dial: %v", err)
+	}
+	defer func() { _ = probeNC.Close() }()
+	if err := control.WriteMessage(probeNC, &control.TCPProbe{
+		Type: control.TypeTCPProbe, SessionID: sid, RateBPS: 1_000,
+	}); err != nil {
+		t.Fatalf("WriteMessage TCPProbe: %v", err)
+	}
+	_ = probeNC.SetReadDeadline(time.Now().Add(2 * time.Second))
+	reply, err := control.ReadMessage(probeNC)
+	if err != nil {
+		t.Fatalf("ReadMessage on probe: %v", err)
+	}
+	e, ok := reply.(*control.Error)
+	if !ok {
+		t.Fatalf("expected Error reply, got %#v", reply)
+	}
+	if !strings.Contains(e.Reason, "not negotiated") {
+		t.Errorf("reason=%q, want substring \"not negotiated\"", e.Reason)
+	}
+}
+
+// A TCP probe must terminate promptly when its session ends, rather
+// than idling on the flat probeMaxLifetime ceiling (5 min). With
+// DurationMS short, the probe socket must be closed by the server
+// well before probeMaxLifetime expires.
+func TestServeProbeTerminatesWithSession(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tcpAddr, _, teardown := startServer(t, ctx, 0)
+	defer teardown()
+
+	c, err := control.Dial(ctx, tcpAddr)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	const durationMS = 500
+	if err := c.Send(&control.Hello{
+		Type: control.TypeHello, Version: 1, Mode: "loss",
+		RateBPS: 1_000_000, DurationMS: durationMS, PacketSize: 64, FlowID: 0xCAFEBABE,
+		TCPCorroborate: "on",
+	}); err != nil {
+		t.Fatalf("Send hello: %v", err)
+	}
+	msg, err := c.Recv()
+	if err != nil {
+		t.Fatalf("Recv ready: %v", err)
+	}
+	ready, ok := msg.(*control.Ready)
+	if !ok {
+		t.Fatalf("expected Ready, got %#v", msg)
+	}
+	if ready.TCPCorroborate != "on" {
+		t.Fatalf("server resolved TCPCorroborate=%q, want \"on\"", ready.TCPCorroborate)
+	}
+
+	probeNC, err := net.Dial("tcp4", tcpAddr)
+	if err != nil {
+		t.Fatalf("probe Dial: %v", err)
+	}
+	defer func() { _ = probeNC.Close() }()
+	if err := control.WriteMessage(probeNC, &control.TCPProbe{
+		Type: control.TypeTCPProbe, SessionID: ready.SessionID, RateBPS: 1_000,
+	}); err != nil {
+		t.Fatalf("WriteMessage TCPProbe: %v", err)
+	}
+
+	start := time.Now()
+	// Block on Read; the server must close the probe socket when the
+	// session's ctx cancels (DurationMS expiry). 2s budget = 4× the
+	// session duration; the old probeMaxLifetime-only behavior would
+	// have taken 5 minutes.
+	_ = probeNC.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 1)
+	if _, err := probeNC.Read(buf); err == nil {
+		t.Fatalf("probe Read returned no error; server should have closed the conn")
+	}
+	elapsed := time.Since(start)
+	if elapsed > 2*time.Second {
+		t.Fatalf("probe close took %s, expected within ~1s of session end (DurationMS=%dms)", elapsed, durationMS)
+	}
 }

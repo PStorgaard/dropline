@@ -230,36 +230,49 @@ func newServeHandler(hub *stream.Hub, reverseCapable bool, maxSessions int, maxR
 	}
 }
 
+// sessionState is the per-session policy + lifetime handle stored in
+// sessionRegistry. ctx is the session's WithTimeout context — probe
+// handlers parent on it so a probe dies when its session does, without
+// waiting for the flat probeMaxLifetime ceiling. tcpProbeOK records
+// whether this session negotiated tcp_corroborate="on"; probes against
+// sessions where it's false are rejected.
+type sessionState struct {
+	ctx        context.Context
+	tcpProbeOK bool
+}
+
 // sessionRegistry tracks the set of session IDs currently held by a
-// live handleSession goroutine. It exists so newProbeHandler can reject
-// tcp_probe connections that don't reference a real session — otherwise
-// any peer with TCP reachability can hold a probe fd open forever.
+// live handleSession goroutine plus the per-session policy a probe
+// handler needs. It exists so newProbeHandler can reject tcp_probe
+// connections that don't reference a real session (otherwise any peer
+// with TCP reachability could hold a probe fd open forever) and so
+// probes inherit the session's lifetime.
 type sessionRegistry struct {
-	mu  sync.Mutex
-	ids map[string]struct{}
+	mu       sync.Mutex
+	sessions map[string]sessionState
 }
 
 func newSessionRegistry() *sessionRegistry {
-	return &sessionRegistry{ids: make(map[string]struct{})}
+	return &sessionRegistry{sessions: make(map[string]sessionState)}
 }
 
-func (r *sessionRegistry) add(sid string) {
+func (r *sessionRegistry) add(sid string, st sessionState) {
 	r.mu.Lock()
-	r.ids[sid] = struct{}{}
+	r.sessions[sid] = st
 	r.mu.Unlock()
 }
 
 func (r *sessionRegistry) remove(sid string) {
 	r.mu.Lock()
-	delete(r.ids, sid)
+	delete(r.sessions, sid)
 	r.mu.Unlock()
 }
 
-func (r *sessionRegistry) has(sid string) bool {
+func (r *sessionRegistry) lookup(sid string) (sessionState, bool) {
 	r.mu.Lock()
-	_, ok := r.ids[sid]
-	r.mu.Unlock()
-	return ok
+	defer r.mu.Unlock()
+	st, ok := r.sessions[sid]
+	return st, ok
 }
 
 func handleSession(ctx context.Context, c *control.Conn, hello *control.Hello, hub *stream.Hub, reverseCapable bool, maxRateBPS int64, allowReverseStream bool, reg *sessionRegistry) error {
@@ -270,10 +283,6 @@ func handleSession(ctx context.Context, c *control.Conn, hello *control.Hello, h
 	if err != nil {
 		return c.Send(&control.Error{Type: control.TypeError, Reason: "internal error: session id"})
 	}
-	// Publish the SID for the lifetime of this handler so a peer's
-	// tcp_probe connection can be matched against an active session.
-	reg.add(sid)
-	defer reg.remove(sid)
 
 	// Pin the TCP control peer's IPv4 address up front; the hub uses it
 	// to drop spoofed-source UDP, and the reverse-trace prober uses it
@@ -329,6 +338,13 @@ func handleSession(ctx context.Context, c *control.Conn, hello *control.Hello, h
 	sessionCtx, cancel := context.WithTimeout(ctx, duration)
 	defer cancel()
 
+	// Publish the session for the lifetime of this handler so a peer's
+	// tcp_probe connection can be matched against an active session and
+	// inherit the session's ctx for prompt teardown. tcpProbeOK gates
+	// probe admission to sessions that actually negotiated corroboration.
+	reg.add(sid, sessionState{ctx: sessionCtx, tcpProbeOK: tcpCorroborateDecision == "on"})
+	defer reg.remove(sid)
+
 	// paused gates the stats forwarder — when set, the per-second
 	// Stats snapshots are dropped on the floor so the client's
 	// sparkline freezes cleanly. Receiver and prober keep running
@@ -378,6 +394,10 @@ func handleSession(ctx context.Context, c *control.Conn, hello *control.Hello, h
 					KernelDrops: s.KernelDrops,
 				}); err != nil {
 					fmt.Fprintf(os.Stderr, "dropline serve: stats forwarder exiting: %s\n", err)
+					// Cancel the session so rcv.Run unwinds and releases the
+					// maxSessions slot now, rather than holding it until
+					// DurationMS expires while the peer ignores us.
+					cancel()
 					return
 				}
 			}
@@ -394,7 +414,7 @@ func handleSession(ctx context.Context, c *control.Conn, hello *control.Hello, h
 	if reverseDecision == "on" {
 		// clientIP was already extracted up top; if it were nil
 		// reverseDecision would have been forced to "off".
-		startReverseTrace(sessionCtx, &reverseWG, c, clientIP, reverseInterval(hello.MTRIntervalMS))
+		startReverseTrace(sessionCtx, cancel, &reverseWG, c, clientIP, reverseInterval(hello.MTRIntervalMS))
 	}
 
 	// Reverse UDP stream: when the resolved decision is "on", run a
@@ -422,13 +442,15 @@ func handleSession(ctx context.Context, c *control.Conn, hello *control.Hello, h
 }
 
 // resolveTCPCorroborate is the server's accept/reject decision for the
-// client's --tcp-corroborate preference. Today the server accepts probe
-// connections unconditionally (the handler is wired in serveRun), so
-// the resolution is trivial — anything other than the explicit "off"
-// resolves to "on". Kept as a function so future server-side gating
-// (e.g. a flag to disable the probe handler) lands here.
+// client's --tcp-corroborate preference. Empty/absent on the wire is the
+// pre-feature old-client signal and resolves to "off" to match Hello's
+// docstring contract; explicit "off" likewise resolves to "off".
+// Anything else ("on", "auto", future values) resolves to "on" so the
+// server is prepared to accept a TCP corroboration probe connection for
+// this session. Per-probe authorization (whether THIS session
+// negotiated "on") is enforced separately in newProbeHandler.
 func resolveTCPCorroborate(clientPref string) string {
-	if clientPref == "off" {
+	if clientPref == "" || clientPref == "off" {
 		return "off"
 	}
 	return "on"
@@ -518,8 +540,11 @@ func clientIPv4(addr net.Addr) net.IP {
 // goroutine, both gated by sessionCtx. The wg is incremented for both
 // goroutines so handleSession can wait for them before sending Final.
 // interval is the TTL-sweep cadence — derived from the client's
-// --mtr-interval (Hello.MTRIntervalMS) with a 1s fallback.
-func startReverseTrace(sessionCtx context.Context, wg *sync.WaitGroup, c *control.Conn, target net.IP, interval time.Duration) {
+// --mtr-interval (Hello.MTRIntervalMS) with a 1s fallback. cancel is
+// the session's CancelFunc; the per-hop forwarder calls it on a
+// terminal c.Send failure so a peer that stops reading TCP releases its
+// session slot promptly rather than waiting for DurationMS.
+func startReverseTrace(sessionCtx context.Context, cancel context.CancelFunc, wg *sync.WaitGroup, c *control.Conn, target net.IP, interval time.Duration) {
 	revSnaps := make(chan probe.Snapshot, 4)
 	prober, err := probe.New(probe.Config{
 		Target:      target,
@@ -571,6 +596,9 @@ func startReverseTrace(sessionCtx context.Context, wg *sync.WaitGroup, c *contro
 						MaxTTL:        maxTTL,
 					}); err != nil {
 						fmt.Fprintf(os.Stderr, "dropline serve: reverse-hop forwarder exiting: %s\n", err)
+						// Cancel the session so rcv.Run unwinds and the slot
+						// frees rather than waiting for DurationMS.
+						cancel()
 						return
 					}
 				}
@@ -743,8 +771,18 @@ func newProbeHandler(reg *sessionRegistry, maxProbes int) control.ProbeHandler {
 	return func(ctx context.Context, nc net.Conn, probe *control.TCPProbe) {
 		// Reject probes that don't match a live session before
 		// taking any slot or starting any goroutines.
-		if probe.SessionID == "" || !reg.has(probe.SessionID) {
+		st, ok := reg.lookup(probe.SessionID)
+		if probe.SessionID == "" || !ok {
 			_ = control.WriteMessage(nc, &control.Error{Type: control.TypeError, Reason: "tcp_probe: unknown or expired session_id"})
+			return
+		}
+		// Probes are admitted only for sessions whose Hello negotiated
+		// tcp_corroborate="on". Any other state — including the
+		// "on"-by-accident from the old resolveTCPCorroborate behavior —
+		// is rejected explicitly so an attacker can't open a probe
+		// against an unrelated session.
+		if !st.tcpProbeOK {
+			_ = control.WriteMessage(nc, &control.Error{Type: control.TypeError, Reason: "tcp_probe: not negotiated for this session"})
 			return
 		}
 		select {
@@ -755,10 +793,12 @@ func newProbeHandler(reg *sessionRegistry, maxProbes int) control.ProbeHandler {
 			return
 		}
 
-		// Hard lifetime ceiling: even a well-behaved peer cannot pin
-		// the probe past probeMaxLifetime. The closer goroutine also
-		// handles server-shutdown via ctx cancellation.
-		probeCtx, cancel := context.WithTimeout(ctx, probeMaxLifetime)
+		// Parent the probe ctx on the session ctx so the probe dies
+		// with its session (normal teardown via DurationMS expiry or
+		// any handleSession exit path). probeMaxLifetime remains as
+		// a defense-in-depth ceiling against a session that somehow
+		// outlives expectations.
+		probeCtx, cancel := context.WithTimeout(st.ctx, probeMaxLifetime)
 		defer cancel()
 		doneCh := make(chan struct{})
 		defer close(doneCh)

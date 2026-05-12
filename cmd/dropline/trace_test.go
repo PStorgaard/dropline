@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"io"
 	"math"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -537,5 +539,67 @@ func TestReverseStreamReportCleanLoopback(t *testing.T) {
 	}
 	if got.LossPct != 0 {
 		t.Errorf("LossPct: want 0, got %f", got.LossPct)
+	}
+}
+
+// startTCPCorroborateProbe must not block trace startup on its second
+// TCP dial. With dial + handshake moved inside an outer goroutine, the
+// caller returns immediately; later wg.Wait must also complete promptly
+// after workerCtx is cancelled. Listener accepts but never reads, so
+// the dial succeeds but the handshake will sit in the kernel buffer —
+// the function still returns instantly because nothing on the caller
+// path waits for the handshake.
+func TestStartTCPCorroborateProbeNonBlocking(t *testing.T) {
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+	// Drain accepts so the dial succeeds; never read so the server side
+	// would block any synchronous handshake. The accepted conns are kept
+	// alive for the duration of the test.
+	accepted := make(chan net.Conn, 4)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			select {
+			case accepted <- c:
+			default:
+				_ = c.Close()
+			}
+		}
+	}()
+	defer func() {
+		close(accepted)
+		for c := range accepted {
+			_ = c.Close()
+		}
+	}()
+
+	cfg := traceConfig{
+		target:             ln.Addr().String(),
+		tcpCorroborateRate: 1_000_000,
+	}
+	aggr := agg.New(time.Now(), nil)
+
+	workerCtx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+
+	start := time.Now()
+	startTCPCorroborateProbe(workerCtx, &wg, cfg, "sid-test", aggr)
+	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
+		t.Fatalf("startTCPCorroborateProbe blocked for %s; expected near-instant return", elapsed)
+	}
+
+	cancel()
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("wg.Wait did not complete within 2s after ctx cancel")
 	}
 }
