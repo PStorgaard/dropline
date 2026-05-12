@@ -218,7 +218,7 @@ loop:
 	statsWG.Wait()
 
 	r.applyHubLocalDrops()
-	if n, err := r.cfg.KernelDrops.Sample(); err == nil {
+	if n, err := kernelDrops.Sample(); err == nil {
 		r.acc.SetKernelDrops(n)
 	}
 	final := r.acc.Snapshot(time.Now())

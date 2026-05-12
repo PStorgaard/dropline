@@ -130,6 +130,57 @@ func TestReceiverFiltersByFlowID(t *testing.T) {
 	}
 }
 
+// The final Snapshot returned by Run must report kernel_drops as the
+// test-window delta (i.e. via the baseline-wrapped sampler), not the
+// raw host-wide counter. Regression for a bug where the final read
+// bypassed the wrapper and overwrote the accumulator with the absolute
+// host UDP-error count since boot.
+func TestReceiverFinalKernelDropsUsesBaseline(t *testing.T) {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	// First sample latches baseline = 1000; every subsequent sample
+	// returns 1050. Padded so the script outlasts any tick count.
+	sampler := &scriptedSampler{
+		values: []int64{1000, 1050, 1050, 1050, 1050, 1050, 1050, 1050, 1050, 1050, 1050, 1050},
+	}
+	r, err := NewReceiver(conn, ReceiverConfig{
+		Tick:        30 * time.Millisecond,
+		Snapshots:   make(chan Snapshot, 16),
+		KernelDrops: sampler,
+	})
+	if err != nil {
+		t.Fatalf("NewReceiver: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	type result struct {
+		s   Snapshot
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		s, err := r.Run(ctx)
+		done <- result{s, err}
+	}()
+
+	// At least one tick to latch the baseline before cancel.
+	time.Sleep(80 * time.Millisecond)
+	cancel()
+
+	select {
+	case res := <-done:
+		if res.s.KernelDrops != 50 {
+			t.Fatalf("final kernel_drops: want 50 (1050 - baseline 1000), got %d", res.s.KernelDrops)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+}
+
 func TestReceiverEmitsPeriodicSnapshots(t *testing.T) {
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
 	if err != nil {

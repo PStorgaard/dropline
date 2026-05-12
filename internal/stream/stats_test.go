@@ -213,6 +213,34 @@ func TestUpdateJitter_RejectsImplausibleTransit(t *testing.T) {
 	}
 }
 
+// Once the dup-detection map fills, Observe must still count the packet
+// and advance the rest of the receiver's state — only map insertion is
+// gated. Regression for a bug where Observe returned early at the cap
+// and froze recv/maxSeq/loss/jitter for the remainder of the test.
+func TestObserve_ContinuesAccountingPastSeenCap(t *testing.T) {
+	t0 := time.Unix(1_000_000_000, 0)
+	a := NewAccumulator(t0)
+	for i := uint64(0); i < uint64(maxSeenEntries); i++ {
+		h := Header{Magic: Magic, FlowID: 1, Seq: i, TxUnixNS: t0.UnixNano()}
+		a.Observe(h, t0.Add(time.Duration(i+1)*time.Microsecond))
+	}
+	post := uint64(maxSeenEntries)
+	a.Observe(
+		Header{Magic: Magic, FlowID: 1, Seq: post, TxUnixNS: t0.UnixNano()},
+		t0.Add(time.Duration(post+1)*time.Microsecond),
+	)
+	s := a.Snapshot(t0.Add(time.Second))
+	if s.Recv != int64(maxSeenEntries)+1 {
+		t.Fatalf("recv: want %d (cap+1), got %d", int64(maxSeenEntries)+1, s.Recv)
+	}
+	if s.MaxSeq != post {
+		t.Fatalf("maxSeq: want %d (post-cap seq), got %d", post, s.MaxSeq)
+	}
+	if s.Lost != 0 {
+		t.Fatalf("lost: want 0 (sequential feed), got %d", s.Lost)
+	}
+}
+
 func TestAccumulatorLocalDropsAndKernel(t *testing.T) {
 	t0 := time.Unix(1_000_000_000, 0)
 	a := NewAccumulator(t0)

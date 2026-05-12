@@ -137,13 +137,14 @@ func (a *Accumulator) Observe(h Header, arrival time.Time) {
 		a.duplicates++
 		return
 	}
-	// Cap memory: once the map fills, stop recording new seqs. Real
-	// dups still resolve against existing entries above; the only
-	// degradation is false-negative dup detection past the cap.
-	if len(a.seen) >= maxSeenEntries {
-		return
+	// Cap memory: once the map fills, keep accounting the packet but
+	// stop recording new seqs. Dups against pre-cap seqs still resolve
+	// above; dups of a post-cap seq are silently miscounted as fresh
+	// recv. The cap bounds the dup map's footprint, not the rest of
+	// the receiver's stats.
+	if len(a.seen) < maxSeenEntries {
+		a.seen[h.Seq] = struct{}{}
 	}
-	a.seen[h.Seq] = struct{}{}
 	a.recv++
 
 	if !a.seenAny {
