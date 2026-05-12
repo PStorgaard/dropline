@@ -385,25 +385,13 @@ func handleSession(ctx context.Context, c *control.Conn, hello *control.Hello, h
 		return c.Send(&control.Error{Type: control.TypeError, Reason: "internal error: " + err.Error()})
 	}
 
-	// paused gates the stats forwarder — when set, the per-second
-	// Stats snapshots are dropped on the floor so the client's
-	// sparkline freezes cleanly. Receiver and prober keep running
-	// underneath; their counters don't move because no packets arrive
-	// during a paused window.
-	var paused atomic.Bool
-
-	// Recv loop demuxes client→server messages. Pause toggles the
-	// forwarder gate; any other message or any error cancels the session.
+	// Recv loop watches for client disconnect. No client→server messages
+	// are expected after Hello; any receive (or error) cancels the session.
 	go func() {
 		for {
-			msg, err := c.Recv()
-			if err != nil {
+			if _, err := c.Recv(); err != nil {
 				cancel()
 				return
-			}
-			if p, ok := msg.(*control.Pause); ok {
-				paused.Store(p.Paused)
-				continue
 			}
 			cancel()
 			return
@@ -411,8 +399,7 @@ func handleSession(ctx context.Context, c *control.Conn, hello *control.Hello, h
 	}()
 
 	// Stats forwarder: pump receiver Snapshots onto the control
-	// channel. When paused the snapshot is consumed but not forwarded.
-	// Exits on the first Send error so a dead peer doesn't drag the
+	// channel. Exits on the first Send error so a dead peer doesn't drag the
 	// session out for the full DurationMS at WriteTimeout per tick.
 	forwarderDone := make(chan struct{})
 	go func() {
@@ -422,9 +409,6 @@ func handleSession(ctx context.Context, c *control.Conn, hello *control.Hello, h
 			case <-sessionCtx.Done():
 				return
 			case s := <-snaps:
-				if paused.Load() {
-					continue
-				}
 				if err := c.Send(&control.Stats{
 					Type:        control.TypeStats,
 					T:           s.T,

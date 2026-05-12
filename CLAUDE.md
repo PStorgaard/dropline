@@ -74,11 +74,12 @@ make e2e            # loopback smoke; on Linux needs raw-ICMP
   enforce this — the recipe is in `cmd/dropline/serve.go` only.
 - **Reverse stream survives only as long as the NAT pinhole.**
   Reverse-direction UDP rides the NAT mapping the client's
-  forward stream established. If the path traverses a NAT with a
-  short idle timeout (<60s) and the test pauses longer than
-  that, the mapping evicts and reverse packets bounce. Pause
-  intentionally doesn't extend test duration, so the worst case
-  is bounded. No code-level workaround in v1.
+  forward stream established. If the forward direction goes idle
+  for longer than the NAT's UDP idle timeout (commonly <60s) the
+  mapping evicts and reverse packets bounce. The sender drives
+  packets continuously for the test's duration, so this only
+  matters for paths with unusually aggressive NAT timeouts. No
+  code-level workaround in v1.
 - **TCP_INFO sampler degrades silently on old Windows.** The
   Windows `internal/tcpinfo/` path calls `WSAIoctl SIO_TCP_INFO`
   with `TCP_INFO_v0`. Pre-Win10-1703 returns `WSAEINVAL`; the

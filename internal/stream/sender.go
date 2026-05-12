@@ -20,17 +20,12 @@ type SenderConfig struct {
 	RateBPS int64
 	// PacketSize is total bytes per UDP datagram, in [HeaderSize, MaxPacketSize].
 	PacketSize int
-	// Duration bounds active send time (excludes time spent paused via
-	// Gate). Zero means "run until ctx is done".
+	// Duration bounds active send time. Zero means "run until ctx is done".
 	Duration time.Duration
 	// FlowID overrides the per-session random flow id when non-zero.
 	FlowID uint32
 	// Now is an injectable clock for tests; defaults to time.Now.
 	Now func() time.Time
-	// Gate, when non-nil, blocks the send loop while paused and shifts
-	// the drift-free pacing schedule by the accumulated pause time.
-	// Sessions without pause support pass nil.
-	Gate *PauseGate
 	// WriteTarget, when non-nil, switches the inner write path from
 	// conn.Write (connected socket) to conn.WriteToUDP(buf, target)
 	// (unconnected socket). This is the server-side reverse-direction
@@ -130,26 +125,12 @@ func (s *Sender) Run(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		// If paused, block here. The gate's wall-clock pause window
-		// folds into the offset, which shifts the drift-free schedule
-		// so resume picks the cadence back up without bursting. One
-		// lock acquisition per iteration in the steady state.
-		var pausedFor time.Duration
-		if s.cfg.Gate != nil {
-			var err error
-			if pausedFor, err = s.cfg.Gate.WaitAndOffset(ctx); err != nil {
-				return err
-			}
-		}
 		now := s.cfg.Now()
-		// Duration is active send time: pauses extend the deadline so
-		// a 60s test always emits 60s worth of packets regardless of
-		// how long the user paused.
-		if s.cfg.Duration > 0 && now.Sub(t0)-pausedFor >= s.cfg.Duration {
+		if s.cfg.Duration > 0 && now.Sub(t0) >= s.cfg.Duration {
 			return nil
 		}
 
-		target := t0.Add(time.Duration(seq)*interval + pausedFor)
+		target := t0.Add(time.Duration(seq) * interval)
 		if err := waitUntil(ctx, target, busyWait, s.cfg.Now); err != nil {
 			return err
 		}

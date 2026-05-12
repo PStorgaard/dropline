@@ -33,7 +33,7 @@ Legend: `[x]` done · `[~]` partial / wired-but-incomplete · `[ ]` todo
 - [x] `--reverse-trace` flag is honored: client sends preference in Hello, server resolves to "on"/"off" in Ready, client maps Ready+pref → `reverse_path_status` (`ok` / `disabled_by_client` / `disabled_by_server`)
 
 ### internal/control
-- [x] JSON message types (Hello, Ready, Error, Stats, Final, ReverseHopUpdate, Pause). Hello + Ready carry `reverse_trace` (omitempty). `Pause{Paused bool}` is the first non-Hello client→server message; the server's per-session recv loop demuxes it (any other message or any error cancels the session, preserving the pre-pause strict-disconnect shape)
+- [x] JSON message types (Hello, Ready, Error, Stats, Final, ReverseHopUpdate). Hello + Ready carry `reverse_trace` (omitempty). No post-Hello client→server messages are expected; the server's per-session recv loop cancels on any receive or error
 - [x] Length-prefixed framing (read + write)
 - [x] Client dialer
 - [x] Server listener + per-connection goroutine
@@ -72,7 +72,6 @@ Legend: `[x]` done · `[~]` partial / wired-but-incomplete · `[ ]` todo
 - [x] Per-second loss timeline / sparkline — 60-bucket window, absolute thresholds (0% always renders flat)
 - [x] Re-arming `tea.Cmd` consuming the snapshot channel
 - [x] Keybindings: `[q]uit` / Ctrl+C / Esc
-- [x] Keybindings: `[p]ause` — `tui.Options.PauseFn` toggles a `stream.PauseGate` (sender blocks while paused, drift-free target shifted by accumulated pause time on resume so no burst) and sends a `control.Pause{Paused bool}` wire message; the server's per-session recv loop demuxes it into an `atomic.Bool` that gates the stats forwarder so the client's sparkline freezes cleanly. Footer shows `[PAUSED] [p] resume` while paused; the elapsed-time counter freezes via accumulated `pausedFor` in the model. Mid-test only. Test duration deadline does NOT pause — pause is for inspecting, not extending
 - [x] Keybindings: `[r]eset` — `Aggregator.Reset()` clears `buckets` and re-arms delta math by stashing the current cumulative snapshot in `last`. Hops/reverse hops intentionally preserved (test-long rolling stats, not per-window history). Active only while the test is running
 - [x] Keybindings: `[c]opy json` — `tui.Options.CopyFn` closure renders `report.Data` via `report.RenderJSON`, base64-encodes the bytes, and writes an OSC 52 escape (`\x1b]52;c;<base64>\a`) to `os.Stdout`. Modern terminals (Windows Terminal, iTerm2, Alacritty, Kitty, WezTerm, tmux with `set-clipboard on`) interpret it as "set system clipboard"; legacy `cmd.exe` / `conhost` silently no-op. Active only on the test-complete view (mid-test press shows "copy: waiting for final"). Reuses the same `builtData` atomic.Pointer the `[s]ave` slice publishes — single source of truth
 - [x] Keybindings: `[s]ave` — `tui.Options.SaveFn` closure resolves the path (`cfg.savePath` if set, else generated `dropline-<sanitized-target>-<unix>.json`) and writes the JSON via `writeJSONFile`. Active only on the test-complete view; mid-test [s] shows a brief "save: waiting for final" hint. `--save FILE` flag still works for non-TUI flows

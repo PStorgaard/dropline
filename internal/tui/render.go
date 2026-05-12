@@ -121,17 +121,13 @@ func renderBar(pct float64, width int) string {
 // elapsed-vs-duration progress bar, the loss/jitter line, the kernel/
 // local drops + bursts strip, and a right-aligned verdict on its own
 // line so it doesn't compete with the loss% for visual weight.
-func renderKPI(opts Options, view agg.StreamView, elapsed time.Duration, paused bool, bar string, width int) string {
+func renderKPI(opts Options, view agg.StreamView, elapsed time.Duration, bar string, width int) string {
 	var sb strings.Builder
 	titleLeft := fmt.Sprintf("dropline · %s · %s", opts.Target, agg.FormatRate(opts.RateBPS))
 
-	// line 1: elapsed [bar] duration (with [PAUSED] prefix when applicable)
-	pausedTag := ""
-	if paused {
-		pausedTag = redStyle.Render("[PAUSED]") + "  "
-	}
-	fmt.Fprintf(&sb, "  %selapsed %s  %s  duration %s\n",
-		pausedTag, formatDuration(elapsed), bar, formatDuration(opts.Duration))
+	// line 1: elapsed [bar] duration
+	fmt.Fprintf(&sb, "  elapsed %s  %s  duration %s\n",
+		formatDuration(elapsed), bar, formatDuration(opts.Duration))
 
 	// line 2: udp loss / jitter / counters
 	lossCell := lossColor(view.LossPct).Render(fmt.Sprintf("%.3f%%", view.LossPct))

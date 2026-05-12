@@ -520,27 +520,12 @@ func TestModelFooterTextLiveAndDone(t *testing.T) {
 		t.Errorf("done footer without CopyFn should not advertise copy; got %q", got)
 	}
 
-	// PauseFn surfaces in the live footer; paused state flips the
-	// label to "[p] resume" and prepends "[PAUSED]".
-	noopPause := func() (bool, error) { return false, nil }
-	liveWithPause := model{opts: Options{ResetFn: noop, SaveFn: noopSave, PauseFn: noopPause}}
-	if got := liveWithPause.footerText(); !strings.Contains(got, "[p] pause") {
-		t.Errorf("live footer with PauseFn should include [p] pause; got %q", got)
-	}
-	pausedModel := model{opts: Options{ResetFn: noop, SaveFn: noopSave, PauseFn: noopPause}, paused: true}
-	got = pausedModel.footerText()
-	if !strings.Contains(got, "[PAUSED]") {
-		t.Errorf("paused footer should be prefixed with [PAUSED]; got %q", got)
-	}
-	if !strings.Contains(got, "[p] resume") {
-		t.Errorf("paused footer should advertise [p] resume; got %q", got)
-	}
-	if strings.Contains(got, "[p] pause ") || strings.HasSuffix(got, "[p] pause") {
-		t.Errorf("paused footer should not advertise [p] pause; got %q", got)
-	}
-	// PauseFn omitted from the done view (pause is mid-test only).
+	// No keybinding should advertise [p] anywhere now that pause is gone.
 	if got := done.footerText(); strings.Contains(got, "[p]") {
 		t.Errorf("done footer should not advertise [p] anything; got %q", got)
+	}
+	if got := liveWithCopy.footerText(); strings.Contains(got, "[p]") {
+		t.Errorf("live footer should not advertise [p] anything; got %q", got)
 	}
 }
 
@@ -550,37 +535,22 @@ func TestRenderKPIVerdict(t *testing.T) {
 	opts := Options{Target: "srv.lab", RateBPS: 10_000_000, Duration: time.Minute}
 	// Width 120: the verdict-substring assertion would otherwise be
 	// fragile to lipgloss wrapping the metrics line at narrow widths.
-	clean := stripANSI(renderKPI(opts, agg.StreamView{LossPct: 0.01, KernelDrops: 0}, 5*time.Second, false, "[bar]", 120))
+	clean := stripANSI(renderKPI(opts, agg.StreamView{LossPct: 0.01, KernelDrops: 0}, 5*time.Second, "[bar]", 120))
 	if !strings.Contains(clean, "✓ network loss is real") {
 		t.Errorf("expected clean verdict; got\n%s", clean)
 	}
-	suspect := stripANSI(renderKPI(opts, agg.StreamView{LossPct: 0.5, KernelDrops: 12}, 5*time.Second, false, "[bar]", 120))
+	suspect := stripANSI(renderKPI(opts, agg.StreamView{LossPct: 0.5, KernelDrops: 12}, 5*time.Second, "[bar]", 120))
 	if !strings.Contains(suspect, "⚠ network loss is suspect") {
 		t.Errorf("expected suspect verdict; got\n%s", suspect)
 	}
 	// LocalDrops alone (KernelDrops==0) must also flip the verdict, since a
 	// non-zero count means receiver overload inflated the loss reading.
-	localSuspect := stripANSI(renderKPI(opts, agg.StreamView{LossPct: 0.5, LocalDrops: 7}, 5*time.Second, false, "[bar]", 120))
+	localSuspect := stripANSI(renderKPI(opts, agg.StreamView{LossPct: 0.5, LocalDrops: 7}, 5*time.Second, "[bar]", 120))
 	if !strings.Contains(localSuspect, "⚠ network loss is suspect") {
 		t.Errorf("expected suspect verdict from LocalDrops alone; got\n%s", localSuspect)
 	}
 	if !strings.Contains(localSuspect, "local drops 7") {
 		t.Errorf("expected 'local drops 7' in KPI body; got\n%s", localSuspect)
-	}
-}
-
-// renderKPI tags the elapsed line with [PAUSED] when paused=true so the
-// section reads "paused" at a glance without the user having to look at
-// the footer.
-func TestRenderKPIPausedPrefix(t *testing.T) {
-	opts := Options{Target: "srv.lab", RateBPS: 10_000_000, Duration: time.Minute}
-	got := stripANSI(renderKPI(opts, agg.StreamView{}, 5*time.Second, true, "[bar]", 80))
-	if !strings.Contains(got, "[PAUSED]") {
-		t.Errorf("expected [PAUSED] in KPI when paused; got\n%s", got)
-	}
-	got = stripANSI(renderKPI(opts, agg.StreamView{}, 5*time.Second, false, "[bar]", 80))
-	if strings.Contains(got, "[PAUSED]") {
-		t.Errorf("did not expect [PAUSED] when paused=false; got\n%s", got)
 	}
 }
 
@@ -591,7 +561,7 @@ func TestRenderKPIIncludesTitleAndBursts(t *testing.T) {
 	view := agg.StreamView{Recv: 4200, Lost: 1}
 	view.Bursts.One = 3
 	view.Bursts.Max = 1
-	got := stripANSI(renderKPI(opts, view, 5*time.Second, false, "[bar]", 100))
+	got := stripANSI(renderKPI(opts, view, 5*time.Second, "[bar]", 100))
 	for _, want := range []string{"dropline · srv.lab", "10.00 Mbps", "bursts ", "recv 4200"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("KPI missing %q; got\n%s", want, got)

@@ -129,12 +129,6 @@ the unit if you want reverse trace enabled.
 While `dropline trace --tui` is running:
 
 - `[q]` / `Ctrl+C` / `Esc` — quit
-- `[p]` — pause / resume the test. The sender stops emitting packets
-  and the server stops forwarding `Stats` (so the sparkline freezes
-  cleanly); the elapsed-time counter freezes too. The test's
-  duration deadline does **not** pause — pause is for inspecting the
-  dashboard, not extending the test, so a 60s test paused for 30s
-  ends at the originally-scheduled wall-clock time with 30s of data.
 - `[r]` — reset the per-second loss timeline (test keeps running)
 - `[s]` — save the JSON report to disk (uses `--save FILE` if set,
   else `dropline-<sanitized-target>-<unix>.json` in the cwd)

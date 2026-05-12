@@ -34,8 +34,6 @@ func TestMessageRoundTrip(t *testing.T) {
 			ReverseSent: 60000, ReverseDurationS: 60.0,
 			TCPBytesRetrans: 12345, TCPBytesOut: 7_500_000,
 		}}},
-		{"pause_true", &Pause{Type: TypePause, Paused: true}},
-		{"pause_false", &Pause{Type: TypePause, Paused: false}},
 		{"tcp_probe", &TCPProbe{Type: TypeTCPProbe, SessionID: "abc-123", RateBPS: 100_000}},
 		{"reverse_hop_update", &ReverseHopUpdate{
 			Type: TypeReverseHopUpdate, TTL: 7, Addr: "203.0.113.4",

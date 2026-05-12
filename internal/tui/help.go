@@ -10,7 +10,6 @@ import (
 // matches against — switch cases in Update still use msg.String() rather
 // than key.Matches because the rest of the file predates this map.
 type keyMap struct {
-	Pause  key.Binding
 	Reset  key.Binding
 	Save   key.Binding
 	Copy   key.Binding
@@ -21,10 +20,6 @@ type keyMap struct {
 
 func newKeyMap() keyMap {
 	return keyMap{
-		Pause: key.NewBinding(
-			key.WithKeys("p"),
-			key.WithHelp("p", "pause / resume"),
-		),
 		Reset: key.NewBinding(
 			key.WithKeys("r"),
 			key.WithHelp("r", "reset history"),
@@ -55,7 +50,7 @@ func newKeyMap() keyMap {
 // ShortHelp satisfies help.KeyMap; unused (we always render FullHelp on
 // the `?` overlay) but kept for completeness.
 func (k keyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Pause, k.Reset, k.Save, k.Copy, k.Help, k.Quit}
+	return []key.Binding{k.Reset, k.Save, k.Copy, k.Help, k.Quit}
 }
 
 // FullHelp returns the two-column layout shown by the `?` overlay. Left
@@ -63,8 +58,8 @@ func (k keyMap) ShortHelp() []key.Binding {
 // chrome-and-output controls.
 func (k keyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
-		{k.Pause, k.Reset},
-		{k.Save, k.Copy},
-		{k.Help, k.Quit, k.Cancel},
+		{k.Reset, k.Save},
+		{k.Copy, k.Help},
+		{k.Quit, k.Cancel},
 	}
 }

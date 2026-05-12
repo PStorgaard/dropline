@@ -17,7 +17,6 @@ const (
 	// without TCP-hop awareness silently ignore the message instead of
 	// rendering it as an ICMP hop.
 	TypeReverseTCPHopUpdate Type = "reverse_tcp_hop_update"
-	TypePause               Type = "pause"
 	// TypeTCPProbe is sent by a client opening a *second* TCP connection
 	// to the dropline server port for TCP retransmit corroboration. The
 	// server's accept loop dispatches by first-message type: Hello → a
@@ -324,24 +323,11 @@ type TCPProbe struct {
 	RateBPS   int64  `json:"rate_bps,omitempty"`
 }
 
-// Pause is a client→server toggle that halts (or resumes) the stats
-// forwarder for the current session. Idempotent — re-sending the same
-// state is a no-op. The first non-Hello message in the client→server
-// direction; the server's recv watcher demuxes it, treating any other
-// message as a fatal disconnect (preserves today's strict shape). The
-// session's duration deadline is intentionally NOT paused — pause is
-// for inspecting the dashboard, not extending the test.
-type Pause struct {
-	Type   Type `json:"type"`
-	Paused bool `json:"paused"`
-}
-
-func (*Hello) controlMessage()            {}
-func (*Ready) controlMessage()            {}
-func (*Error) controlMessage()            {}
-func (*Stats) controlMessage()            {}
-func (*Final) controlMessage()            {}
+func (*Hello) controlMessage()               {}
+func (*Ready) controlMessage()               {}
+func (*Error) controlMessage()               {}
+func (*Stats) controlMessage()               {}
+func (*Final) controlMessage()               {}
 func (*ReverseHopUpdate) controlMessage()    {}
 func (*ReverseTCPHopUpdate) controlMessage() {}
-func (*Pause) controlMessage()               {}
 func (*TCPProbe) controlMessage()            {}

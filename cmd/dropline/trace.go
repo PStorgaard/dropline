@@ -597,18 +597,11 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 		defer func() { _ = tcpProber.Close() }()
 	}
 
-	// Pause gate is shared between the sender (which blocks on it) and
-	// the TUI's [p] keybinding callback (which toggles it). Always
-	// constructed; the TUI flow wires PauseFn while --report / --json
-	// flows leave PauseFn nil so the gate is never flipped.
-	pauseGate := stream.NewPauseGate(nil)
-
 	sender, err := stream.NewSender(udpConn, stream.SenderConfig{
 		RateBPS:    cfg.rateBPS,
 		PacketSize: cfg.packetSize,
 		Duration:   cfg.duration,
 		FlowID:     flowID,
-		Gate:       pauseGate,
 		Token:      token,
 	})
 	if err != nil {
@@ -853,7 +846,6 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 			ResetFn:   aggregator.Reset,
 			SaveFn:    makeSaveFn(cfg, &builtData),
 			CopyFn:    makeCopyFn(&builtData, os.Stdout),
-			PauseFn:   makePauseFn(pauseGate, cc),
 		}); err != nil {
 			workerCancel()
 			workersWG.Wait()
@@ -1329,37 +1321,6 @@ func makeSaveFn(cfg traceConfig, builtData *atomic.Pointer[report.Data]) func() 
 	}
 }
 
-// makePauseFn returns the closure passed to tui.Options.PauseFn. The
-// TUI invokes it on every [p] keypress; the closure flips the local
-// sender's pause gate (so the sender stops emitting packets) and
-// sends a Pause wire message so the server stops forwarding Stats —
-// without that, the client's sparkline would fill with zero-loss
-// buckets through the pause and look misleadingly healthy.
-//
-// Returns the new paused state and any wire-send error. If the wire
-// send fails the local gate is rolled back so client and server stay
-// in lockstep.
-func makePauseFn(gate *stream.PauseGate, cc *control.Conn) func() (bool, error) {
-	return func() (bool, error) {
-		newPaused := !gate.IsPaused()
-		if newPaused {
-			gate.Pause()
-		} else {
-			gate.Resume()
-		}
-		if err := cc.Send(&control.Pause{Type: control.TypePause, Paused: newPaused}); err != nil {
-			// Roll back so the local sender state matches what the
-			// server believes.
-			if newPaused {
-				gate.Resume()
-			} else {
-				gate.Pause()
-			}
-			return !newPaused, err
-		}
-		return newPaused, nil
-	}
-}
 
 // makeCopyFn returns the closure passed to tui.Options.CopyFn. The TUI
 // only invokes it once Final has arrived, but we still guard for the

@@ -38,14 +38,6 @@ type model struct {
 	// keybinding fires (e.g. "wrote: foo.json"). Empty otherwise.
 	status   string
 	statusAt time.Time
-	// paused tracks the sticky pause indicator surfaced in the footer.
-	// pausedAt is the wall-clock time the current pause began, zero
-	// when not paused. pausedFor accumulates the wall-clock time spent
-	// in completed pause cycles; both feed View's elapsed-time math
-	// so the header counter freezes during a pause.
-	paused    bool
-	pausedAt  time.Time
-	pausedFor time.Duration
 	// helpVisible toggles the `?` overlay. When true View() renders the
 	// help model fullscreen and skips the dashboard entirely.
 	helpVisible bool
@@ -148,24 +140,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.setStatus(fmt.Sprintf("copied: %d bytes", n))
 			}
 			return m, nil
-		case "p":
-			if m.helpVisible || m.opts.PauseFn == nil || m.done {
-				return m, nil
-			}
-			now := time.Now()
-			paused, err := m.opts.PauseFn()
-			if err != nil {
-				m.setStatus("pause failed: " + err.Error())
-				return m, nil
-			}
-			if paused && !m.paused {
-				m.pausedAt = now
-			} else if !paused && m.paused {
-				m.pausedFor += now.Sub(m.pausedAt)
-				m.pausedAt = time.Time{}
-			}
-			m.paused = paused
-			return m, nil
 		}
 		return m, nil
 	case snapshotMsg:
@@ -203,10 +177,7 @@ func (m model) View() tea.View {
 		return v
 	}
 
-	elapsed := time.Since(m.opts.StartedAt) - m.pausedFor
-	if m.paused && !m.pausedAt.IsZero() {
-		elapsed -= time.Since(m.pausedAt)
-	}
+	elapsed := time.Since(m.opts.StartedAt)
 	if elapsed < 0 {
 		elapsed = 0
 	}
@@ -227,7 +198,7 @@ func (m model) View() tea.View {
 	// zone is one rule-headed block; consecutive zones get a blank line
 	// between them so the eye has somewhere to rest.
 	sections := []string{
-		renderKPI(m.opts, m.latest.Stream, elapsed, m.paused, bar, m.width),
+		renderKPI(m.opts, m.latest.Stream, elapsed, bar, m.width),
 	}
 	if rev := renderReverseKPI(m.latest.ReverseStream, m.width); rev != "" {
 		sections = append(sections, rev)
@@ -280,7 +251,7 @@ func (m model) View() tea.View {
 // hints once snaps has closed, and overlays the transient status (e.g.
 // "wrote: foo.json") when one is active.
 func (m model) footerText() string {
-	if m.status != "" && !m.paused {
+	if m.status != "" {
 		return m.status
 	}
 	if m.done {
@@ -294,10 +265,6 @@ func (m model) footerText() string {
 		parts = append(parts, "[?] help", "[q] exit")
 		return strings.Join(parts, " · ")
 	}
-	pauseLabel := "[p] pause"
-	if m.paused {
-		pauseLabel = "[p] resume"
-	}
 	parts := []string{"[?] help", "[q] quit"}
 	if m.opts.ResetFn != nil {
 		parts = append([]string{"[r] reset"}, parts...)
@@ -308,14 +275,7 @@ func (m model) footerText() string {
 	if m.opts.CopyFn != nil {
 		parts = append([]string{"[c] copy"}, parts...)
 	}
-	if m.opts.PauseFn != nil {
-		parts = append([]string{pauseLabel}, parts...)
-	}
-	hint := strings.Join(parts, " · ")
-	if m.paused {
-		return "[PAUSED] " + hint
-	}
-	return hint
+	return strings.Join(parts, " · ")
 }
 
 // waitSnapshot returns a Cmd that blocks on one read from the aggregator's

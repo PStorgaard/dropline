@@ -1,9 +1,9 @@
 // Package tui implements the bubbletea Model/Update/View for the live
 // dashboard. Spec § TUI is the long-term target; this slice ships the
 // skeleton (header, forward hop table, stream summary, loss/sec
-// sparkline, q/ctrl+c quit). [p]ause / [r]eset / [c]opy / [s]ave
-// keybindings, ▲ rolling-baseline indicators, and the column-collapse
-// ladder land with later slices — see progress.md.
+// sparkline, q/ctrl+c quit). [r]eset / [c]opy / [s]ave keybindings,
+// ▲ rolling-baseline indicators, and the column-collapse ladder land
+// with later slices — see progress.md.
 package tui
 
 import (
@@ -38,13 +38,6 @@ type Options struct {
 	// callback's job (the TUI package stays free of OS-side IO); the
 	// TUI only surfaces the outcome in the footer.
 	CopyFn func() (int, error)
-	// PauseFn, when non-nil, is called on [p] keypresses while the
-	// test is running. It toggles the sender's pause state and the
-	// server's stats forwarder via a wire-level Pause message.
-	// Returns the new paused state and any error from the wire send.
-	// The TUI tracks its own paused-display flag from the returned
-	// state.
-	PauseFn func() (paused bool, err error)
 }
 
 // Run starts the bubbletea program and blocks until the user quits or
