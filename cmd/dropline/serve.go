@@ -136,6 +136,12 @@ func serveRun(ctx context.Context, cfg serveConfig) error {
 		fmt.Fprintf(os.Stderr, "dropline serve: reverse trace disabled (%s)\n", rawICMP.Reason)
 	}
 
+	// Match the direct receiver's SO_RCVBUF target so multi-session
+	// hub-driven serving doesn't run on the OS default buffer. The
+	// kernel silently caps at rmem_max; the warning below surfaces
+	// that case.
+	_ = udpConn.SetReadBuffer(stream.DefaultSocketBuf)
+
 	// Best-effort warning when the kernel's rmem_max would cap the
 	// receiver's SO_RCVBUF target — silent on non-Linux and on
 	// /proc-read failures (see internal/stream/rmemmax_*).
@@ -313,6 +319,19 @@ func handleSession(ctx context.Context, c *control.Conn, hello *control.Hello, h
 	}
 	defer flowHandle.Release()
 
+	duration := time.Duration(hello.DurationMS) * time.Millisecond
+	sessionCtx, cancel := context.WithTimeout(ctx, duration)
+	defer cancel()
+
+	// Publish the session BEFORE sending Ready. The client cannot
+	// learn session_id until Ready reaches it, but once it does it
+	// may dial the TCP probe socket immediately — if reg.add hadn't
+	// happened yet, the probe handler would reject as "unknown or
+	// expired session_id". tcpProbeOK gates probe admission to
+	// sessions that actually negotiated corroboration.
+	reg.add(sid, sessionState{ctx: sessionCtx, tcpProbeOK: tcpCorroborateDecision == "on"})
+	defer reg.remove(sid)
+
 	if err := c.Send(&control.Ready{
 		Type:           control.TypeReady,
 		SessionID:      sid,
@@ -333,17 +352,6 @@ func handleSession(ctx context.Context, c *control.Conn, hello *control.Hello, h
 	if err != nil {
 		return c.Send(&control.Error{Type: control.TypeError, Reason: "internal error: " + err.Error()})
 	}
-
-	duration := time.Duration(hello.DurationMS) * time.Millisecond
-	sessionCtx, cancel := context.WithTimeout(ctx, duration)
-	defer cancel()
-
-	// Publish the session for the lifetime of this handler so a peer's
-	// tcp_probe connection can be matched against an active session and
-	// inherit the session's ctx for prompt teardown. tcpProbeOK gates
-	// probe admission to sessions that actually negotiated corroboration.
-	reg.add(sid, sessionState{ctx: sessionCtx, tcpProbeOK: tcpCorroborateDecision == "on"})
-	defer reg.remove(sid)
 
 	// paused gates the stats forwarder — when set, the per-second
 	// Stats snapshots are dropped on the floor so the client's
@@ -730,12 +738,15 @@ func validateHello(h *control.Hello, maxRateBPS int64) string {
 			h.MTRIntervalMS, minMTRIntervalMS, maxMTRIntervalMS)
 	}
 	// TCPCorroborateRateBPS == 0 means "TCP corroboration disabled" (the
-	// field is omitempty on the wire). When non-zero, apply the same
-	// per-session cap as the forward UDP rate.
+	// field is omitempty on the wire). When the client opted out via
+	// TCPCorroborate=="off", the rate is meaningless even if non-zero
+	// — don't reject the session for a feature it isn't using. When
+	// the client wants corroboration, apply the same per-session cap
+	// as the forward UDP rate.
 	if h.TCPCorroborateRateBPS < 0 {
 		return fmt.Sprintf("tcp_corroborate_rate_bps must be >= 0, got %d", h.TCPCorroborateRateBPS)
 	}
-	if maxRateBPS > 0 && h.TCPCorroborateRateBPS > maxRateBPS {
+	if h.TCPCorroborate != "off" && maxRateBPS > 0 && h.TCPCorroborateRateBPS > maxRateBPS {
 		return fmt.Sprintf("tcp_corroborate_rate_bps %d exceeds server cap %d",
 			h.TCPCorroborateRateBPS, maxRateBPS)
 	}

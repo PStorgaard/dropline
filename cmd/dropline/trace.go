@@ -433,6 +433,14 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 			}
 		}
 	}
+	// When the user opted out of TCP corroboration the rate field is
+	// meaningless; zero it on the wire so the server's per-session
+	// rate cap doesn't reject a session for a feature we aren't
+	// using. omitempty on the field makes 0 wire-equivalent to absent.
+	tcpCorrRateOnWire := cfg.tcpCorroborateRate
+	if cfg.tcpCorroborate == reverseOff {
+		tcpCorrRateOnWire = 0
+	}
 	hello := &control.Hello{
 		Type:                  control.TypeHello,
 		Version:               1,
@@ -446,7 +454,7 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 		ReverseStream:         cfg.reverseStream.String(),
 		ReverseFlowID:         reverseFlowID,
 		TCPCorroborate:        cfg.tcpCorroborate.String(),
-		TCPCorroborateRateBPS: cfg.tcpCorroborateRate,
+		TCPCorroborateRateBPS: tcpCorrRateOnWire,
 	}
 	if err := cc.Send(hello); err != nil {
 		return fmt.Errorf("send hello: %w", err)

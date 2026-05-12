@@ -165,6 +165,25 @@ func TestValidateHelloRateCap(t *testing.T) {
 	if reason := validateHello(&zero, 100_000_000); reason != "" {
 		t.Errorf("tcp-corroborate zero (disabled) rejected with cap: %q", reason)
 	}
+
+	// When the client opted out via TCPCorroborate="off", the rate
+	// field is meaningless and must not gate admission even if it
+	// exceeds the cap (legacy clients populated this field
+	// unconditionally; a low --max-rate-bps shouldn't reject them).
+	offOverCap := *good
+	offOverCap.TCPCorroborate = "off"
+	offOverCap.TCPCorroborateRateBPS = 200_000_000
+	if reason := validateHello(&offOverCap, 100_000_000); reason != "" {
+		t.Errorf("tcp-corroborate=off with over-cap rate rejected: %q", reason)
+	}
+	// Regression guard: when corroboration is requested, the cap
+	// still applies even if the explicit "on" string is present.
+	onOverCap := *good
+	onOverCap.TCPCorroborate = "on"
+	onOverCap.TCPCorroborateRateBPS = 200_000_000
+	if reason := validateHello(&onOverCap, 100_000_000); !strings.Contains(reason, "tcp_corroborate_rate_bps") {
+		t.Errorf("tcp-corroborate=on with over-cap rate accepted: reason=%q", reason)
+	}
 }
 
 // TestValidateHelloMTRBounds covers the MTR-interval bounds. Zero is the
