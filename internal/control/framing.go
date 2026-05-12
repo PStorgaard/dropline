@@ -94,6 +94,8 @@ func ReadMessage(r io.Reader) (Message, error) {
 		msg = &Final{}
 	case TypeReverseHopUpdate:
 		msg = &ReverseHopUpdate{}
+	case TypeReverseTCPHopUpdate:
+		msg = &ReverseTCPHopUpdate{}
 	case TypePause:
 		msg = &Pause{}
 	case TypeTCPProbe:

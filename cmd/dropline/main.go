@@ -19,6 +19,8 @@ Usage:
                         [--reverse-stream auto|on|off]
                         [--tcp-corroborate auto|on|off]
                         [--tcp-corroborate-rate 100K]
+                        [--tcp-hop-probe auto|on|off]
+                        [--tcp-hop-probe-port 443]
   dropline service install [--listen :5301] [--max-sessions 4]
                            [--max-rate-bps 1G] [--allow-reverse-stream]
   dropline service uninstall

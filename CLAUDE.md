@@ -86,6 +86,18 @@ make e2e            # loopback smoke; on Linux needs raw-ICMP
   stats with nil error for the rest of the session. The wire
   shape stays the same (`tcp_corroborate` section present with
   zeros), so renderers don't branch.
+- **TCP-mode hop prober (`--tcp-hop-probe`) is Linux/macOS only.**
+  `probe_tcp_unix.go` sends SYNs via `connect()+IP_TTL` and demuxes
+  ICMP `TimeExceeded` on its own raw ICMP socket (one per TCPProber;
+  fine at current volumes). Three things matter for future edits:
+  (1) `SO_LINGER {Onoff:1, Linger:0}` must be set in the
+  `Dialer.Control` hook BEFORE `connect()` so a completed handshake
+  closes via RST — without this, TIME_WAIT accumulates. (2) Each
+  `TCPProber` reserves `4×MaxHops` contiguous source ports from a
+  process-global cursor; don't shrink the factor below 2 or slots
+  alias across `lossTimeout`. (3) Windows is a permanent stub
+  (`probe_tcp_windows.go`) emitting `Supported=false` — iphlpapi has
+  no TCP-traceroute equivalent and WinDivert needs CGO.
 
 ## CI / releases
 

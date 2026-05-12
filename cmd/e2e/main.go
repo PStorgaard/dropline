@@ -73,7 +73,7 @@ func run(bin string) error {
 		return err
 	}
 
-	out, err := runTrace(bin, addr)
+	out, err := runTrace(bin, addr, port)
 	if err != nil {
 		return err
 	}
@@ -158,17 +158,23 @@ func (sp *serverProc) kill() {
 	_ = sp.cmd.Wait()
 }
 
-// runTrace invokes `dropline trace addr --rate 1M --duration 2s --json`
-// and returns the captured stdout on success. On non-zero exit it
-// returns an error wrapping the captured stderr — that's where the
-// trace command's privcheck banner / connection-refused errors land.
-func runTrace(bin, addr string) ([]byte, error) {
+// runTrace invokes `dropline trace addr --rate 1M --duration 2s --json
+// --tcp-hop-probe=on --tcp-hop-probe-port=<port>` and returns the
+// captured stdout on success. On non-zero exit it returns an error
+// wrapping the captured stderr — that's where the trace command's
+// privcheck banner / connection-refused errors land. The TCP-hop-probe
+// destination port is the server's control TCP port, which is always
+// open during the test so SYNs at any TTL get a SYN-ACK or land at
+// the destination — perfect for exercising the prober end-to-end.
+func runTrace(bin, addr string, port int) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), traceTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, bin, "trace", addr,
 		"--rate", "1M",
 		"--duration", "2s",
 		"--json",
+		"--tcp-hop-probe=on",
+		fmt.Sprintf("--tcp-hop-probe-port=%d", port),
 	)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -217,6 +223,20 @@ type traceJSON struct {
 		BytesOut     uint64  `json:"bytes_out"`
 		RetransPct   float64 `json:"retrans_pct"`
 	} `json:"tcp_corroborate,omitempty"`
+	TCPHopProbe *struct {
+		Supported   bool   `json:"supported"`
+		Port        uint16 `json:"port"`
+		ForwardHops []struct {
+			TTL  int    `json:"ttl"`
+			IP   string `json:"ip"`
+			Sent int64  `json:"sent"`
+		} `json:"forward_hops"`
+		ReverseHops []struct {
+			TTL  int    `json:"ttl"`
+			Addr string `json:"addr"`
+			Sent int64  `json:"sent"`
+		} `json:"reverse_hops"`
+	} `json:"tcp_hop_probe,omitempty"`
 }
 
 func assertHealthy(d traceJSON) error {
@@ -294,5 +314,45 @@ func assertHealthy(d traceJSON) error {
 	// reliably or pathologically depending on TCP stack tuning. The
 	// signal we care about for the e2e is "the wiring is intact"; the
 	// retransmit value's correctness is covered by tcpinfo unit tests.
+
+	// tcp_hop_probe: the trace invocation enables it with --tcp-hop-probe=on
+	// so the section must be present. Platform-specific assertions:
+	//
+	//   Linux/macOS: Supported=true, at least one forward hop with sent>0.
+	//   Loopback resolves to a single TTL=1 terminus hop (the destination
+	//   is one hop away on lo), so we don't require multiple hops.
+	//
+	//   Windows: Supported=false (the stub emits one Snapshot with no hops
+	//   and blocks on ctx). Section is still present so the wire shape is
+	//   uniform across platforms.
+	if d.TCPHopProbe == nil {
+		return errors.New("tcp_hop_probe section missing (--tcp-hop-probe=on should populate it)")
+	}
+	if runtime.GOOS == "windows" {
+		if d.TCPHopProbe.Supported {
+			return errors.New("tcp_hop_probe.supported = true on Windows; expected stub Supported=false")
+		}
+		if len(d.TCPHopProbe.ForwardHops) != 0 {
+			return fmt.Errorf("tcp_hop_probe.forward_hops on Windows must be empty, got %d entries",
+				len(d.TCPHopProbe.ForwardHops))
+		}
+		return nil
+	}
+	if !d.TCPHopProbe.Supported {
+		return fmt.Errorf("tcp_hop_probe.supported = false on %s; expected true with raw-ICMP capability", runtime.GOOS)
+	}
+	if len(d.TCPHopProbe.ForwardHops) == 0 {
+		return errors.New("tcp_hop_probe.forward_hops is empty; prober never resolved a hop")
+	}
+	anySent := false
+	for _, h := range d.TCPHopProbe.ForwardHops {
+		if h.Sent > 0 {
+			anySent = true
+			break
+		}
+	}
+	if !anySent {
+		return errors.New("tcp_hop_probe.forward_hops has no hop with sent>0 (prober wired but never fired?)")
+	}
 	return nil
 }

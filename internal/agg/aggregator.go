@@ -51,6 +51,18 @@ type Aggregator struct {
 	// snapshotLocked publishes a TCPCorroborateView pointer in every
 	// emitted StateSnapshot.
 	lastTCPInfo *TCPCorroborateView
+	// tcpHops mirrors `hops` but for the TCP-mode hop prober. Rebuilt
+	// on every IngestForwardTCPHop. Empty when the feature is off.
+	tcpHops []HopView
+	// reverseTCPHops mirrors `reverseHops` but for the reverse TCP-mode
+	// hop prober. Upserted by TTL on each IngestReverseTCPHop.
+	reverseTCPHops map[int]ReverseHopView
+	// tcpHopProbePort is non-zero once a TCP-mode snapshot has arrived
+	// (carries the probed destination port for renderer labels).
+	tcpHopProbePort uint16
+	// tcpHopProbeSupported tracks the most recent TCP-mode snapshot's
+	// Supported field. False on Windows (stub), true on Linux/macOS.
+	tcpHopProbeSupported bool
 }
 
 // New constructs an Aggregator. t0 is informational only this slice — it
@@ -62,9 +74,10 @@ type Aggregator struct {
 // state but emit nothing.
 func New(t0 time.Time, out chan<- StateSnapshot) *Aggregator {
 	return &Aggregator{
-		t0:          t0,
-		out:         out,
-		reverseHops: make(map[int]ReverseHopView),
+		t0:             t0,
+		out:            out,
+		reverseHops:    make(map[int]ReverseHopView),
+		reverseTCPHops: make(map[int]ReverseHopView),
 	}
 }
 
@@ -236,6 +249,97 @@ func (a *Aggregator) IngestForwardHop(s probe.Snapshot) {
 	a.emit(state)
 }
 
+// IngestForwardTCPHop records one TCP-mode probe.TCPSnapshot. It
+// overwrites the aggregator's TCP-hop view (separate from the ICMP one
+// at LatestForwardHops) and emits a fresh StateSnapshot. The first
+// snapshot's Supported flag latches the aggregator's
+// tcpHopProbeSupported state so renderers can show "(unsupported on
+// Windows)" before any hops arrive (the stub emits exactly one
+// Supported=false snapshot with empty Hops).
+//
+// Sends are non-blocking — see IngestStream.
+func (a *Aggregator) IngestForwardTCPHop(s probe.TCPSnapshot) {
+	a.mu.Lock()
+	a.tcpHopProbeSupported = s.Supported
+	if s.Port != 0 {
+		a.tcpHopProbePort = s.Port
+	}
+	a.tcpHops = make([]HopView, len(s.Hops))
+	for i, h := range s.Hops {
+		a.tcpHops[i] = HopView{
+			TTL:           h.TTL,
+			IP:            h.Addr,
+			Sent:          h.Sent,
+			Recv:          h.Recv,
+			LastRTTMS:     h.LastRTTMS,
+			BestRTTMS:     h.BestRTTMS,
+			WorstRTTMS:    h.WorstRTTMS,
+			AvgRTTMS:      h.AvgRTTMS,
+			StdDevRTTMS:   h.StdDevRTTMS,
+			BaselineRTTMS: h.BaselineRTTMS,
+			LossPct:       h.LossPct,
+			Terminus:      h.Terminus,
+		}
+	}
+	// Attribute this TCP-hop snapshot to its bucket so CorrelateTCP can
+	// score per-bucket co-occurrence against the same stream-loss
+	// buckets the ICMP correlator uses. Mirrors IngestForwardHop's
+	// bucketing logic — see the comments there for the wallclock-vs-
+	// receiver-t0 race rationale.
+	if len(a.tcpHops) > 0 {
+		elapsed := s.At.Sub(a.t0).Seconds()
+		bucketIdx := int(math.Floor(elapsed))
+		if bucketIdx < 0 {
+			bucketIdx = 0
+		}
+		cur := a.bucketAtLocked(bucketIdx)
+		cur.TCPHops = make([]HopView, len(a.tcpHops))
+		copy(cur.TCPHops, a.tcpHops)
+	}
+	state := a.snapshotLocked(a.lastTLocked(), a.lastView)
+	a.mu.Unlock()
+	a.emit(state)
+}
+
+// IngestReverseTCPHop records one ReverseTCPHopUpdate and emits a
+// fresh StateSnapshot. Mirrors IngestReverseHop but writes into the
+// reverseTCPHops map. The first update's Port (when set) latches the
+// aggregator's tcpHopProbePort so renderers can label the reverse
+// section consistently even before the forward prober's first
+// snapshot.
+//
+// Sends are non-blocking — see IngestStream.
+func (a *Aggregator) IngestReverseTCPHop(u control.ReverseTCPHopUpdate) {
+	a.mu.Lock()
+	if u.Port != 0 && a.tcpHopProbePort == 0 {
+		a.tcpHopProbePort = u.Port
+	}
+	a.reverseTCPHops[u.TTL] = ReverseHopView{
+		TTL:           u.TTL,
+		Addr:          u.Addr,
+		RTTMS:         u.RTTMS,
+		LossPct:       u.LossPct,
+		Sent:          u.Sent,
+		Recv:          u.Recv,
+		BestRTTMS:     u.BestRTTMS,
+		WorstRTTMS:    u.WorstRTTMS,
+		AvgRTTMS:      u.AvgRTTMS,
+		StdDevRTTMS:   u.StdDevRTTMS,
+		BaselineRTTMS: u.BaselineRTTMS,
+		Terminus:      u.Terminus,
+	}
+	if u.MaxTTL > 0 {
+		for ttl := range a.reverseTCPHops {
+			if ttl > u.MaxTTL {
+				delete(a.reverseTCPHops, ttl)
+			}
+		}
+	}
+	state := a.snapshotLocked(a.lastTLocked(), a.lastView)
+	a.mu.Unlock()
+	a.emit(state)
+}
+
 // IngestReverseHop records one ReverseHopUpdate and emits a fresh
 // StateSnapshot. The map is upserted by TTL — each update replaces any
 // previous entry for the same hop. Stream-side state is unchanged; the
@@ -317,6 +421,38 @@ func (a *Aggregator) MarkSuspects(ttls []int) {
 	a.emit(state)
 }
 
+// MarkTCPSuspects mirrors MarkSuspects for the TCP-mode hop table. Used
+// when the cross-source correlator flags a TTL whose suspect score
+// came from TCP-mode evidence; the trace driver calls this in addition
+// to MarkSuspects so both tables highlight the same hops on the
+// test-complete view. Per-bucket TCPHops are marked too so JSON
+// timeline consumers see the flag consistently with the ICMP side.
+func (a *Aggregator) MarkTCPSuspects(ttls []int) {
+	if len(ttls) == 0 {
+		return
+	}
+	a.mu.Lock()
+	want := make(map[int]bool, len(ttls))
+	for _, ttl := range ttls {
+		want[ttl] = true
+	}
+	for i := range a.tcpHops {
+		if want[a.tcpHops[i].TTL] {
+			a.tcpHops[i].Suspect = true
+		}
+	}
+	for bi := range a.buckets {
+		for i := range a.buckets[bi].TCPHops {
+			if want[a.buckets[bi].TCPHops[i].TTL] {
+				a.buckets[bi].TCPHops[i].Suspect = true
+			}
+		}
+	}
+	state := a.snapshotLocked(a.lastTLocked(), a.lastView)
+	a.mu.Unlock()
+	a.emit(state)
+}
+
 // Reset clears the per-second history and re-arms delta math so the next
 // IngestStream call attributes zero deltas to a fresh bucket. Hops and
 // reverse hops are intentionally preserved — they are test-long rolling
@@ -337,6 +473,9 @@ func (a *Aggregator) Reset() {
 	// flagged by the previous test's MarkSuspects.
 	for i := range a.hops {
 		a.hops[i].Suspect = false
+	}
+	for i := range a.tcpHops {
+		a.tcpHops[i].Suspect = false
 	}
 	state := a.snapshotLocked(a.lastTLocked(), a.lastView)
 	a.mu.Unlock()
@@ -393,6 +532,10 @@ func (a *Aggregator) snapshotLocked(t float64, stream StreamView) StateSnapshot 
 			bc.Hops = make([]HopView, len(b.Hops))
 			copy(bc.Hops, b.Hops)
 		}
+		if len(b.TCPHops) > 0 {
+			bc.TCPHops = make([]HopView, len(b.TCPHops))
+			copy(bc.TCPHops, b.TCPHops)
+		}
 		bucketsCopy[i] = bc
 	}
 	hopsCopy := make([]HopView, len(a.hops))
@@ -414,15 +557,28 @@ func (a *Aggregator) snapshotLocked(t float64, stream StreamView) StateSnapshot 
 		v := *a.lastTCPInfo
 		tcpInfo = &v
 	}
+	tcpHopsCopy := make([]HopView, len(a.tcpHops))
+	copy(tcpHopsCopy, a.tcpHops)
+	reverseTCPCopy := make([]ReverseHopView, 0, len(a.reverseTCPHops))
+	for _, v := range a.reverseTCPHops {
+		reverseTCPCopy = append(reverseTCPCopy, v)
+	}
+	sort.Slice(reverseTCPCopy, func(i, j int) bool {
+		return reverseTCPCopy[i].TTL < reverseTCPCopy[j].TTL
+	})
 	return StateSnapshot{
-		T:                 t,
-		Stream:            stream,
-		Buckets:           bucketsCopy,
-		LatestForwardHops: hopsCopy,
-		LatestReverseHops: reverseCopy,
-		ReversePathStatus: a.reverseStatus,
-		ReverseStream:     reverseStream,
-		TCPCorroborate:    tcpInfo,
+		T:                    t,
+		Stream:               stream,
+		Buckets:              bucketsCopy,
+		LatestForwardHops:    hopsCopy,
+		LatestReverseHops:    reverseCopy,
+		ReversePathStatus:    a.reverseStatus,
+		ReverseStream:        reverseStream,
+		TCPCorroborate:       tcpInfo,
+		LatestForwardTCPHops: tcpHopsCopy,
+		LatestReverseTCPHops: reverseTCPCopy,
+		TCPHopProbeSupported: a.tcpHopProbeSupported,
+		TCPHopProbePort:      a.tcpHopProbePort,
 	}
 }
 

@@ -40,6 +40,26 @@ type StateSnapshot struct {
 	// disabled). Renderers branch on nil to decide whether to render
 	// the section.
 	TCPCorroborate *TCPCorroborateView
+	// LatestForwardTCPHops is the most recent TCP-mode hop table from
+	// the client's TCPProber (parallel to LatestForwardHops, which is
+	// ICMP). Empty when TCP-mode hop probing was off for the session
+	// or when no snapshot has arrived yet.
+	LatestForwardTCPHops []HopView
+	// LatestReverseTCPHops is the merged reverse-direction TCP hop
+	// table — the latest ReverseTCPHopUpdate for each TTL. Empty when
+	// reverse TCP-hop is off.
+	LatestReverseTCPHops []ReverseHopView
+	// TCPHopProbeSupported reflects the most recent TCPSnapshot's
+	// Supported field. False on Windows (no TCP-traceroute path
+	// available), true on Linux/macOS once a snapshot has arrived.
+	// Meaningful only when TCPHopProbePort > 0.
+	TCPHopProbeSupported bool
+	// TCPHopProbePort is the destination port the TCP-mode prober was
+	// configured with. Zero when the feature was off for this session;
+	// non-zero when the prober ran (even on Windows where it runs as a
+	// stub). Renderers branch on Port > 0 to decide whether to render
+	// the TCP-hop section.
+	TCPHopProbePort uint16
 }
 
 // TCPCorroborateView mirrors tcpinfo.Stats in the renderer's type
@@ -153,4 +173,10 @@ type Bucket struct {
 	// ascending; same shape as StateSnapshot.LatestForwardHops. Used by
 	// the JSON timeline output and the suspect-hop correlator.
 	Hops []HopView
+	// TCPHops mirrors Hops for the TCP-mode hop prober. Empty when
+	// TCP-mode hop probing was off for the session or no
+	// IngestForwardTCPHop has fired in this bucket. Powers the
+	// CorrelateTCP suspect scoring against the same loss-event buckets
+	// the ICMP correlator uses.
+	TCPHops []HopView
 }

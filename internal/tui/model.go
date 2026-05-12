@@ -244,6 +244,15 @@ func (m model) View() tea.View {
 		renderHopTable(m.latest.LatestForwardHops, m.width),
 		renderReverseHopTable(m.latest.LatestReverseHops, m.latest.ReversePathStatus, m.width),
 	)
+	if m.latest.TCPHopProbePort > 0 {
+		sections = append(sections, renderTCPHopTable(
+			m.latest.LatestForwardTCPHops, m.latest.TCPHopProbePort,
+			m.latest.TCPHopProbeSupported, m.width))
+		if m.latest.TCPHopProbeSupported && len(m.latest.LatestReverseTCPHops) > 0 {
+			sections = append(sections, renderReverseTCPHopTable(
+				m.latest.LatestReverseTCPHops, m.latest.TCPHopProbePort, m.width))
+		}
+	}
 
 	parts := make([]string, 0, 2*len(sections)+1)
 	for i, s := range sections {

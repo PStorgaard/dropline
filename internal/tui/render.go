@@ -232,7 +232,7 @@ func renderHopTable(hops []agg.HopView, width int) string {
 		return renderRule("forward path", headerStyle, "  "+dimStyle.Render("(no hops resolved yet)"), width)
 	}
 	ladder := ladderFor(width)
-	headers := hopHeaders(ladder, "IP")
+	headers := hopHeaders(ladder, "IP", "ICMP Loss%")
 	items := collapseSilentRuns(len(hops), func(i int) bool { return hops[i].IP == "" })
 	rows := make([][]string, 0, len(items))
 	for _, it := range items {
@@ -303,7 +303,7 @@ func renderReverseHopTable(hops []agg.ReverseHopView, status string, width int) 
 		return renderRule(title, headerStyle, "  "+annStyle.Render("(no reverse hops)"), width)
 	}
 	ladder := ladderFor(width)
-	headers := hopHeaders(ladder, "Addr")
+	headers := hopHeaders(ladder, "Addr", "ICMP Loss%")
 	items := collapseSilentRuns(len(hops), func(i int) bool { return hops[i].Addr == "" })
 	rows := make([][]string, 0, len(items))
 	for _, it := range items {
@@ -443,18 +443,18 @@ func silentSummaryRow(l columnLadder, startTTL, endTTL int, sent int64) []string
 // hopHeaders returns the header slice for the chosen ladder rung.
 // addrLabel parameterises the column name so the forward and reverse
 // tables can share the layout while keeping their distinct vocabulary
-// ("IP" vs "Addr"). The loss column is labelled "ICMP Loss%" to make
-// it clear this is per-hop probe loss, not the UDP stream test loss
-// in the KPI card — routers that rate-limit or drop ICMP read as 100%
-// here even though user traffic passes through cleanly.
-func hopHeaders(l columnLadder, addrLabel string) []string {
+// ("IP" vs "Addr"). lossLabel is the loss-column heading — typically
+// "ICMP Loss%" for the ICMP probers and "TCP Loss%" for the TCP-mode
+// prober — so the operator can tell at a glance which probe source's
+// per-hop loss is rendered.
+func hopHeaders(l columnLadder, addrLabel, lossLabel string) []string {
 	switch {
 	case l.showWide:
-		return []string{"TTL", addrLabel, "Sent", "ICMP Loss%", "Last", "Avg", "Best", "Worst"}
+		return []string{"TTL", addrLabel, "Sent", lossLabel, "Last", "Avg", "Best", "Worst"}
 	case l.showAddr:
-		return []string{"TTL", addrLabel, "Sent", "ICMP Loss%", "Last", "Avg"}
+		return []string{"TTL", addrLabel, "Sent", lossLabel, "Last", "Avg"}
 	default:
-		return []string{"TTL", "Sent", "ICMP Loss%", "Last", "Avg"}
+		return []string{"TTL", "Sent", lossLabel, "Last", "Avg"}
 	}
 }
 
@@ -616,6 +616,127 @@ func reverseStatusStyle(status string) lipgloss.Style {
 	default:
 		return amberStyle
 	}
+}
+
+// renderTCPHopTable mirrors renderHopTable for the TCP-mode hop prober.
+// Wrapped in its own section frame labelled with the probed
+// destination port so the operator can distinguish it from the ICMP
+// table at a glance. Suspect rows carry the same red "!" gutter prefix
+// as the ICMP table; the agg correlator's MergeSuspects step ensures
+// "icmp+tcp" verdicts highlight the same TTL in both tables.
+//
+// supported=false (Windows stub) renders a one-line notice in place of
+// the table so the section is visible (the operator knows the feature
+// was on) without misleading them about real loss.
+func renderTCPHopTable(hops []agg.HopView, port uint16, supported bool, width int) string {
+	title := fmt.Sprintf("tcp hop probe (forward, port %d)", port)
+	if !supported {
+		return renderRule(title, headerStyle, "  "+amberStyle.Render("(unsupported on this host)"), width)
+	}
+	if len(hops) == 0 {
+		return renderRule(title, headerStyle, "  "+dimStyle.Render("(no hops resolved yet)"), width)
+	}
+	ladder := ladderFor(width)
+	headers := hopHeaders(ladder, "IP", "TCP Loss%")
+	items := collapseSilentRuns(len(hops), func(i int) bool { return hops[i].IP == "" })
+	rows := make([][]string, 0, len(items))
+	for _, it := range items {
+		if it.runEnd >= 0 {
+			rows = append(rows, silentSummaryRow(ladder, hops[it.runStart].TTL, hops[it.runEnd].TTL, hops[it.runStart].Sent))
+			continue
+		}
+		i := it.single
+		h := hops[i]
+		silent := h.IP == ""
+		ttl := fmt.Sprintf("%d", h.TTL)
+		if h.Suspect && !silent {
+			ttl = redStyle.Render("!") + ttl
+		}
+		ip := h.IP
+		if silent {
+			ip = "*"
+		}
+		var lossCell string
+		switch {
+		case silent:
+			lossCell = dimStyle.Render("—")
+		case agg.RateLimitedICMP(hops, i):
+			lossCell = dimStyle.Render(fmt.Sprintf("%.2f%%", h.LossPct))
+		default:
+			lossCell = lossColor(h.LossPct).Render(fmt.Sprintf("%.2f%%", h.LossPct))
+		}
+		last := fmt.Sprintf("%.2f", h.LastRTTMS)
+		if g := rttBaselineGlyphFor(h.LastRTTMS, h.BaselineRTTMS, h.StdDevRTTMS); strings.TrimSpace(stripAnsiInline(g)) != "" {
+			last = g + last
+		}
+		row := hopRow(ladder,
+			ttl, ip,
+			fmt.Sprintf("%d", h.Sent),
+			lossCell,
+			last,
+			fmt.Sprintf("%.2f", h.AvgRTTMS),
+			fmt.Sprintf("%.2f", h.BestRTTMS),
+			fmt.Sprintf("%.2f", h.WorstRTTMS),
+		)
+		if silent && !h.Suspect {
+			row = dimRow(row)
+		}
+		rows = append(rows, row)
+	}
+	body := buildHopTable(headers, rows)
+	return renderRule(title, headerStyle, indentBlock(body, 2), width)
+}
+
+// renderReverseTCPHopTable mirrors renderReverseHopTable for the
+// TCP-mode reverse hop prober. Status is folded into the parent
+// ICMP-side reverse status — TCP and ICMP reverse-trace share the same
+// privcheck.RawICMP gate, so they go on/off together.
+func renderReverseTCPHopTable(hops []agg.ReverseHopView, port uint16, width int) string {
+	title := fmt.Sprintf("tcp hop probe (reverse, port %d, %d hops)", port, len(hops))
+	if len(hops) == 0 {
+		return renderRule(title, headerStyle, "  "+dimStyle.Render("(no reverse hops)"), width)
+	}
+	ladder := ladderFor(width)
+	headers := hopHeaders(ladder, "Addr", "TCP Loss%")
+	items := collapseSilentRuns(len(hops), func(i int) bool { return hops[i].Addr == "" })
+	rows := make([][]string, 0, len(items))
+	for _, it := range items {
+		if it.runEnd >= 0 {
+			rows = append(rows, silentSummaryRow(ladder, hops[it.runStart].TTL, hops[it.runEnd].TTL, hops[it.runStart].Sent))
+			continue
+		}
+		h := hops[it.single]
+		silent := h.Addr == ""
+		addr := h.Addr
+		if silent {
+			addr = "*"
+		}
+		var lossCell string
+		if silent {
+			lossCell = dimStyle.Render("—")
+		} else {
+			lossCell = lossColor(h.LossPct).Render(fmt.Sprintf("%.2f%%", h.LossPct))
+		}
+		last := fmt.Sprintf("%.2f", h.RTTMS)
+		if g := rttBaselineGlyphFor(h.RTTMS, h.BaselineRTTMS, h.StdDevRTTMS); strings.TrimSpace(stripAnsiInline(g)) != "" {
+			last = g + last
+		}
+		row := hopRow(ladder,
+			fmt.Sprintf("%d", h.TTL), addr,
+			fmt.Sprintf("%d", h.Sent),
+			lossCell,
+			last,
+			fmt.Sprintf("%.2f", h.AvgRTTMS),
+			fmt.Sprintf("%.2f", h.BestRTTMS),
+			fmt.Sprintf("%.2f", h.WorstRTTMS),
+		)
+		if silent {
+			row = dimRow(row)
+		}
+		rows = append(rows, row)
+	}
+	body := buildHopTable(headers, rows)
+	return renderRule(title, headerStyle, indentBlock(body, 2), width)
 }
 
 // sparkIndex maps per-second loss% to a slot in sparkRunes. Thresholds are

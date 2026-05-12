@@ -69,6 +69,8 @@ dropline trace TARGET
     [--reverse-stream on|off|auto]     (default: auto)
     [--tcp-corroborate on|off|auto]    (default: auto)
     [--tcp-corroborate-rate 100K]      (bps; suffixes K/M/G accepted)
+    [--tcp-hop-probe on|off|auto]      (default: off; opt-in)
+    [--tcp-hop-probe-port 443]         (destination port for SYN probes)
     [--tui | --report | --json]        (default: --tui on a TTY,
                                         --report otherwise)
     [--save FILE]                      (always writes JSON form)
@@ -92,6 +94,16 @@ counters answer "is the observed UDP loss path-wide, or UDP-specific?"
 — the local sampler is unavailable on macOS/BSD and pre-Win10-1703
 Windows, in which case the report flags the section as `unsupported`
 rather than implying zero retransmits.
+
+`--tcp-hop-probe` runs a TCP-mode TTL-walker in parallel with the ICMP
+prober: SYN packets with escalating TTL, demuxed via embedded TCP
+source port in ICMP `TimeExceeded`. Catches hops that filter ICMP echo
+but still emit `TimeExceeded` for TCP (common on cloud/enterprise
+edges), and lets the suspect-hop correlator cross-check the two
+signals — a TTL flagged in both reads as `icmp+tcp` in the report.
+Linux/macOS only; on Windows the section renders `unsupported`.
+Off by default; pair with `--tcp-hop-probe-port` to pick the
+destination port (default 443).
 
 ## Linux: systemd
 
@@ -207,11 +219,11 @@ Key fields:
 - `version`, `target`, `started_at`, `duration_s`
 - `config` — `rate_bps`, `packet_size`, `mtr_interval_ms`, `max_hops`,
   and the user-chosen mode strings `reverse_trace`, `reverse_stream`,
-  `tcp_corroborate` (each `on`/`off`/`auto`) plus
-  `tcp_corroborate_rate_bps`. The mode strings record what the user
-  asked for; the negotiated outcome surfaces in `reverse_path_status`,
-  the presence/absence of `reverse_stream`, and
-  `tcp_corroborate.supported`
+  `tcp_corroborate`, `tcp_hop_probe` (each `on`/`off`/`auto`) plus
+  `tcp_corroborate_rate_bps` and `tcp_hop_probe_port`. The mode strings
+  record what the user asked for; the negotiated outcome surfaces in
+  `reverse_path_status`, the presence/absence of `reverse_stream`, and
+  `tcp_corroborate.supported` / `tcp_hop_probe.supported`
 - `hops[]` — forward path with rolling RTT and per-hop loss%; each
   entry carries the hop's `ip` address and a `suspect` flag
 - `reverse_path[]`, `reverse_path_status` — reverse trace from
@@ -230,13 +242,22 @@ Key fields:
   `supported: false` means the local kernel doesn't expose `TCP_INFO`
   on this host; the byte/RTT counters are zero in that case and must
   not be read as "0 retransmits observed"
-- `timeline[]` — per-second buckets with `stream_loss` and a
-  `hops` snapshot of the forward path at that second; `hops[].suspect`
-  is propagated from the end-of-test correlator verdict
-- `correlation.suspect_hops[]` — `{ttl, confidence, evidence}`,
+- `tcp_hop_probe` (when tcp-hop-probe was on) — `supported`, `port`,
+  `forward_hops[]`, `reverse_hops[]`. Forward/reverse hops have the
+  same shape as `hops[]` / `reverse_path[]`. `supported: false` means
+  the platform can't run the TCP-mode prober (Windows); the hop
+  arrays are empty in that case
+- `timeline[]` — per-second buckets with `stream_loss`, a `hops`
+  snapshot of the forward path at that second, and (when tcp-hop-probe
+  was on) a parallel `tcp_hops[]` snapshot. `hops[].suspect` is
+  propagated from the end-of-test correlator verdict
+- `correlation.suspect_hops[]` — `{ttl, confidence, evidence, source}`,
   ranked descending by confidence; populated when a hop's
   RTT-vs-baseline or per-hop loss spikes co-occur with stream-loss
-  seconds
+  seconds. `source` is `icmp`, `tcp`, or `icmp+tcp` — the last reads
+  as the strongest evidence (both probe sources flagged the same TTL)
+  and is omitted from the JSON for plain `icmp` to keep the legacy
+  shape byte-identical
 
 ```bash
 dropline trace srv.lab --duration 30s --json \

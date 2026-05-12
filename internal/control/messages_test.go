@@ -43,6 +43,19 @@ func TestMessageRoundTrip(t *testing.T) {
 			Sent: 12, Recv: 12, BestRTTMS: 12.1, WorstRTTMS: 18.4,
 			AvgRTTMS: 14.0, StdDevRTTMS: 1.5, BaselineRTTMS: 13.8,
 		}},
+		{"hello_tcp_hop_probe", &Hello{
+			Type: TypeHello, Version: 1, Mode: "loss", RateBPS: 5_000_000, DurationMS: 60_000,
+			PacketSize: 1200, FlowID: 33, TCPHopProbe: "on", TCPHopProbePort: 443,
+		}},
+		{"ready_tcp_hop_probe", &Ready{
+			Type: TypeReady, SessionID: "tcphop-1", TCPHopProbe: "on",
+		}},
+		{"reverse_tcp_hop_update", &ReverseTCPHopUpdate{
+			Type: TypeReverseTCPHopUpdate, TTL: 9, Addr: "198.51.100.7", Port: 443,
+			RTTMS: 21.5, LossPct: 0.0, Terminus: "host",
+			Sent: 5, Recv: 5, BestRTTMS: 20.8, WorstRTTMS: 24.1,
+			AvgRTTMS: 21.7, StdDevRTTMS: 0.9, BaselineRTTMS: 21.4,
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

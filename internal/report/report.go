@@ -51,6 +51,26 @@ type Data struct {
 	// or when the local platform's TCP_INFO sampler is a nop. Used to
 	// answer "is the observed UDP loss path-wide, or UDP-specific?".
 	TCPCorroborate *TCPCorroborateReport
+	// TCPHopProbe summarizes TCP-mode hop probing for the session. nil
+	// when the feature was off. When non-nil with Supported=false (e.g.
+	// Windows) the renderer shows an "unsupported" notice rather than
+	// an empty hop table. The forward / reverse hop tables themselves
+	// are carried on this report struct so renderers can dim a TTL the
+	// ICMP tables also rendered.
+	TCPHopProbe *TCPHopProbeReport
+}
+
+// TCPHopProbeReport mirrors the TCP-mode hop probing surface in the
+// renderer's type space. Port is the destination port the prober
+// targeted. Supported is false on Windows (the stub emits
+// Supported=false from its first snapshot). ForwardHops + ReverseHops
+// are the latest per-TTL hop tables, parallel to Data.Hops /
+// Data.ReversePath for the ICMP side.
+type TCPHopProbeReport struct {
+	Supported   bool               `json:"supported"`
+	Port        uint16             `json:"port"`
+	ForwardHops []HopReport        `json:"forward_hops"`
+	ReverseHops []ReverseHopReport `json:"reverse_hops"`
 }
 
 // TCPCorroborateReport mirrors agg.TCPCorroborateView in the renderer's
@@ -106,11 +126,15 @@ type ReverseStreamReport struct {
 
 // SuspectHopReport mirrors agg.SuspectHop in the renderer's type space so
 // the report layer never imports internal/agg directly. The trace driver
-// is the adapter between them.
+// is the adapter between them. Source is the probe source(s) that
+// flagged this hop: "icmp", "tcp", or "icmp+tcp" for cross-source
+// corroboration. Empty Source is treated as "icmp" by renderers for
+// backward compatibility.
 type SuspectHopReport struct {
 	TTL        int
 	Confidence float64
 	Evidence   string
+	Source     string
 }
 
 // HopReport is the per-hop view passed to the renderers. Mirrors the
@@ -169,6 +193,12 @@ type Config struct {
 	ReverseStream         string `json:"reverse_stream"`
 	TCPCorroborate        string `json:"tcp_corroborate"`
 	TCPCorroborateRateBPS int64  `json:"tcp_corroborate_rate_bps"`
+	// TCPHopProbe / TCPHopProbePort record the user's TCP-mode hop
+	// probing knob ("on"/"off"/"auto") and chosen destination port.
+	// Omitempty so legacy reports without these knobs stay byte-
+	// identical when the feature isn't used.
+	TCPHopProbe     string `json:"tcp_hop_probe,omitempty"`
+	TCPHopProbePort uint16 `json:"tcp_hop_probe_port,omitempty"`
 }
 
 // lossPct returns Stream.Loss / (Stream.Recv + Stream.Loss) * 100, or 0

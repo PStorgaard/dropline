@@ -322,9 +322,11 @@ func handleSession(ctx context.Context, c *control.Conn, hello *control.Hello, h
 	reverseDecision := resolveReverseTrace(hello.ReverseTrace, reverseCapable)
 	reverseStreamDecision, reverseStreamFlowID := resolveReverseStream(hello.ReverseStream, hello.ReverseFlowID, hello.FlowID)
 	tcpCorroborateDecision := resolveTCPCorroborate(hello.TCPCorroborate)
+	tcpHopProbeDecision := resolveTCPHopProbe(hello.TCPHopProbe, reverseCapable)
 	if clientIP == nil {
 		reverseDecision = "off"
 		reverseStreamDecision, reverseStreamFlowID = "off", 0
+		tcpHopProbeDecision = "off"
 	}
 	if !allowReverseStream {
 		reverseStreamDecision, reverseStreamFlowID = "off", 0
@@ -368,6 +370,7 @@ func handleSession(ctx context.Context, c *control.Conn, hello *control.Hello, h
 		ReverseStream:  reverseStreamDecision,
 		ReverseFlowID:  reverseStreamFlowID,
 		TCPCorroborate: tcpCorroborateDecision,
+		TCPHopProbe:    tcpHopProbeDecision,
 	}); err != nil {
 		return err
 	}
@@ -453,6 +456,10 @@ func handleSession(ctx context.Context, c *control.Conn, hello *control.Hello, h
 		// reverseDecision would have been forced to "off".
 		startReverseTrace(sessionCtx, cancel, &reverseWG, c, clientIP, reverseInterval(hello.MTRIntervalMS))
 	}
+	if tcpHopProbeDecision == "on" {
+		startReverseTCPHopProbe(sessionCtx, cancel, &reverseWG, c, clientIP,
+			hello.TCPHopProbePort, reverseInterval(hello.MTRIntervalMS))
+	}
 
 	// Reverse UDP stream: when the resolved decision is "on", run a
 	// Sender writing back to the client's first-observed UDP source
@@ -488,6 +495,19 @@ func handleSession(ctx context.Context, c *control.Conn, hello *control.Hello, h
 // negotiated "on") is enforced separately in newProbeHandler.
 func resolveTCPCorroborate(clientPref string) string {
 	if clientPref == "" || clientPref == "off" {
+		return "off"
+	}
+	return "on"
+}
+
+// resolveTCPHopProbe picks the server's reverse-direction TCP-mode
+// hop-probe decision. Only "on" enables the reverse prober — "auto" is
+// opt-in-only in v1 to match the client's default. capable threads the
+// server's raw-ICMP capability through (same gate as reverseCapable for
+// the ICMP reverse trace; TCP-mode probing needs the dedicated raw ICMP
+// recv socket on the server too).
+func resolveTCPHopProbe(clientPref string, capable bool) string {
+	if clientPref != "on" || !capable {
 		return "off"
 	}
 	return "on"
@@ -647,6 +667,80 @@ func startReverseTrace(sessionCtx context.Context, cancel context.CancelFunc, wg
 	}()
 }
 
+// startReverseTCPHopProbe is the TCP-mode analogue of startReverseTrace.
+// Opens a TCPProber that fires SYN+TTL toward the client's TCP source
+// IP at the negotiated destination port and streams ReverseTCPHopUpdate
+// per resolved hop. The client doesn't need to be listening on the
+// destination port — intermediate routers still emit TimeExceeded for
+// each TTL expiry, and a closed-port RST at the destination registers
+// as terminus the same way EchoReply does for the ICMP path.
+func startReverseTCPHopProbe(sessionCtx context.Context, cancel context.CancelFunc, wg *sync.WaitGroup, c *control.Conn, target net.IP, port uint16, interval time.Duration) {
+	revSnaps := make(chan probe.TCPSnapshot, 4)
+	prober, err := probe.NewTCP(probe.TCPConfig{
+		Target:      target,
+		Port:        port,
+		MTRInterval: interval,
+		MaxHops:     30,
+	}, revSnaps)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "dropline serve: reverse tcp-hop prober init failed: %s\n", err)
+		return
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := prober.Run(sessionCtx); err != nil {
+			fmt.Fprintf(os.Stderr, "dropline serve: reverse tcp-hop prober: %s\n", err)
+		}
+	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-sessionCtx.Done():
+				return
+			case snap := <-revSnaps:
+				if !snap.Supported {
+					// Windows server (unlikely; raw-ICMP gate normally
+					// vetoes Windows-side reverse trace anyway) — emit
+					// nothing. Client falls back to the ICMP reverse
+					// view; renderer keeps the tcp_hop_probe section
+					// hidden on the reverse side.
+					continue
+				}
+				maxTTL := 0
+				if n := len(snap.Hops); n > 0 {
+					maxTTL = snap.Hops[n-1].TTL
+				}
+				for _, h := range snap.Hops {
+					if err := c.Send(&control.ReverseTCPHopUpdate{
+						Type:          control.TypeReverseTCPHopUpdate,
+						TTL:           h.TTL,
+						Addr:          h.Addr,
+						Port:          port,
+						RTTMS:         h.LastRTTMS,
+						LossPct:       h.LossPct,
+						Terminus:      classifyTerminus(h, target),
+						Sent:          h.Sent,
+						Recv:          h.Recv,
+						BestRTTMS:     h.BestRTTMS,
+						WorstRTTMS:    h.WorstRTTMS,
+						AvgRTTMS:      h.AvgRTTMS,
+						StdDevRTTMS:   h.StdDevRTTMS,
+						BaselineRTTMS: h.BaselineRTTMS,
+						MaxTTL:        maxTTL,
+					}); err != nil {
+						fmt.Fprintf(os.Stderr, "dropline serve: reverse tcp-hop forwarder exiting: %s\n", err)
+						cancel()
+						return
+					}
+				}
+			}
+		}
+	}()
+}
+
 // reverseInterval picks the reverse prober's TTL-walk cadence from the
 // client's Hello.MTRIntervalMS, with a 1s fallback when the field is
 // missing (old client) or non-positive.
@@ -790,6 +884,17 @@ func validateHello(h *control.Hello, maxRateBPS int64) string {
 	if h.TCPCorroborate != "off" && maxRateBPS > 0 && h.TCPCorroborateRateBPS > maxRateBPS {
 		return fmt.Sprintf("tcp_corroborate_rate_bps %d exceeds server cap %d",
 			h.TCPCorroborateRateBPS, maxRateBPS)
+	}
+	// TCP-mode hop probe: bound the port string-flag and the destination
+	// port. Empty / "off" / "auto" are all accepted (resolved by
+	// resolveTCPHopProbe); "on" requires a positive destination port.
+	switch h.TCPHopProbe {
+	case "", "off", "auto", "on":
+	default:
+		return fmt.Sprintf("tcp_hop_probe must be on, off, or auto; got %q", h.TCPHopProbe)
+	}
+	if h.TCPHopProbe == "on" && (h.TCPHopProbePort < 1) {
+		return fmt.Sprintf("tcp_hop_probe_port must be > 0 when tcp_hop_probe=on, got %d", h.TCPHopProbePort)
 	}
 	return ""
 }

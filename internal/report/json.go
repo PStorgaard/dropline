@@ -26,8 +26,21 @@ type jsonDoc struct {
 	Stream            jsonStream            `json:"stream"`
 	ReverseStream     *ReverseStreamReport  `json:"reverse_stream,omitempty"`
 	TCPCorroborate    *TCPCorroborateReport `json:"tcp_corroborate,omitempty"`
+	TCPHopProbe       *jsonTCPHopProbe      `json:"tcp_hop_probe,omitempty"`
 	Correlation       jsonCorrelation       `json:"correlation"`
 	Timeline          []jsonTimelineRow     `json:"timeline"`
+}
+
+// jsonTCPHopProbe is the wire shape of the tcp_hop_probe section.
+// Supported reflects platform capability (false on Windows); Port is
+// the probed destination port. ForwardHops / ReverseHops mirror the
+// ICMP-side `hops` / `reverse_path` shapes so consumers can apply the
+// same parser.
+type jsonTCPHopProbe struct {
+	Supported   bool             `json:"supported"`
+	Port        uint16           `json:"port"`
+	ForwardHops []jsonHop        `json:"forward_hops"`
+	ReverseHops []jsonReverseHop `json:"reverse_hops"`
 }
 
 // jsonReverseHop mirrors jsonHop's shape — same `rtt_ms` struct, same
@@ -102,12 +115,20 @@ type jsonSuspectHop struct {
 	TTL        int     `json:"ttl"`
 	Confidence float64 `json:"confidence"`
 	Evidence   string  `json:"evidence"`
+	// Source is "icmp", "tcp", or "icmp+tcp". Omitempty so legacy
+	// (ICMP-only) reports keep the v1 wire shape — consumers without
+	// TCP-hop awareness treat the absence as "icmp".
+	Source string `json:"source,omitempty"`
 }
 
 type jsonTimelineRow struct {
 	T          int       `json:"t"`
 	StreamLoss int64     `json:"stream_loss"`
 	Hops       []jsonHop `json:"hops"`
+	// TCPHops mirrors Hops for the TCP-mode prober's per-bucket
+	// snapshots. Omitempty so legacy reports stay byte-identical when
+	// TCP-mode hop probing was off.
+	TCPHops []jsonHop `json:"tcp_hops,omitempty"`
 }
 
 // RenderJSON writes the JSON form of d to w with two-space indentation
@@ -151,6 +172,7 @@ func RenderJSON(w io.Writer, d Data) error {
 		},
 		ReverseStream:  d.ReverseStream,
 		TCPCorroborate: d.TCPCorroborate,
+		TCPHopProbe:    tcpHopProbeToJSON(d.TCPHopProbe),
 		Correlation:    jsonCorrelation{SuspectHops: suspectHopsToJSON(d.Correlation)},
 		Timeline:       make([]jsonTimelineRow, 0, len(d.Timeline)),
 	}
@@ -159,6 +181,7 @@ func RenderJSON(w io.Writer, d Data) error {
 			T:          b.T,
 			StreamLoss: b.StreamLost,
 			Hops:       hopViewsToJSON(b.Hops),
+			TCPHops:    hopViewsToJSONOmitEmpty(b.TCPHops),
 		})
 	}
 	enc := json.NewEncoder(w)
@@ -173,13 +196,46 @@ func RenderJSON(w io.Writer, d Data) error {
 func suspectHopsToJSON(src []SuspectHopReport) []jsonSuspectHop {
 	out := make([]jsonSuspectHop, len(src))
 	for i, h := range src {
+		// Omit "icmp" so legacy reports keep the v1 byte-identical shape;
+		// only emit Source when it carries information beyond the default.
+		src := h.Source
+		if src == "icmp" {
+			src = ""
+		}
 		out[i] = jsonSuspectHop{
 			TTL:        h.TTL,
 			Confidence: h.Confidence,
 			Evidence:   h.Evidence,
+			Source:     src,
 		}
 	}
 	return out
+}
+
+// tcpHopProbeToJSON converts the renderer's TCPHopProbeReport into the
+// JSON wire shape. Returns nil when src is nil (the feature was off
+// for this session) so the JSON omits the section entirely.
+func tcpHopProbeToJSON(src *TCPHopProbeReport) *jsonTCPHopProbe {
+	if src == nil {
+		return nil
+	}
+	return &jsonTCPHopProbe{
+		Supported:   src.Supported,
+		Port:        src.Port,
+		ForwardHops: hopsToJSON(src.ForwardHops),
+		ReverseHops: reverseHopsToJSON(src.ReverseHops),
+	}
+}
+
+// hopViewsToJSONOmitEmpty mirrors hopViewsToJSON but returns nil for
+// empty input, so an `omitempty`-tagged field disappears from the JSON
+// when no hops were captured. Used for the TCPHops timeline field so
+// legacy reports without TCP-mode probing stay byte-identical.
+func hopViewsToJSONOmitEmpty(src []agg.HopView) []jsonHop {
+	if len(src) == 0 {
+		return nil
+	}
+	return hopViewsToJSON(src)
 }
 
 // hopViewsToJSON converts an agg.HopView slice (from a per-second

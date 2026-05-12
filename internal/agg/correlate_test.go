@@ -288,3 +288,64 @@ func TestCorrelateBothSignalsMaxWins(t *testing.T) {
 		t.Errorf("loss should dominate evidence, got %q", got[0].Evidence)
 	}
 }
+
+func TestCorrelateTCPReadsTCPHops(t *testing.T) {
+	// CorrelateTCP must score the bucket's TCPHops slice, not Hops. The
+	// bucket below has ICMP hop showing clean RTT and TCP hop showing a
+	// spike — CorrelateTCP must flag the hop, plain Correlate must not.
+	hops := []HopView{{TTL: 1, IP: "10.0.0.1", AvgRTTMS: 1.0, StdDevRTTMS: 0.1}}
+	buckets := []Bucket{
+		{T: 0, StreamLossPct: 10,
+			Hops:    []HopView{{TTL: 1, LastRTTMS: 1.0, LossPct: 0}}, // ICMP clean
+			TCPHops: []HopView{{TTL: 1, LastRTTMS: 50.0, LossPct: 0}}, // TCP spike
+		},
+	}
+	icmpSuspects := Correlate(buckets, hops)
+	if len(icmpSuspects) != 0 {
+		t.Errorf("ICMP correlator should see clean ICMP-side, got %+v", icmpSuspects)
+	}
+	tcpSuspects := CorrelateTCP(buckets, hops)
+	if len(tcpSuspects) != 1 || tcpSuspects[0].Source != "tcp" {
+		t.Fatalf("TCP correlator should flag TCP-side spike with Source=tcp, got %+v", tcpSuspects)
+	}
+}
+
+func TestMergeSuspectsFoldsMatchingTTLs(t *testing.T) {
+	icmp := []SuspectHop{{TTL: 7, Confidence: 0.8, Evidence: "ICMP evidence", Source: "icmp"}}
+	tcp := []SuspectHop{{TTL: 7, Confidence: 0.9, Evidence: "TCP evidence", Source: "tcp"}}
+	merged := MergeSuspects(icmp, tcp)
+	if len(merged) != 1 {
+		t.Fatalf("want 1 merged suspect, got %d (%+v)", len(merged), merged)
+	}
+	if merged[0].Source != "icmp+tcp" {
+		t.Errorf("merged Source should be icmp+tcp, got %q", merged[0].Source)
+	}
+	if merged[0].Confidence != 0.9 {
+		t.Errorf("merged Confidence should be max, got %v", merged[0].Confidence)
+	}
+	if !strings.Contains(merged[0].Evidence, "both ICMP and TCP") {
+		t.Errorf("merged Evidence should mention both, got %q", merged[0].Evidence)
+	}
+}
+
+func TestMergeSuspectsKeepsDistinctTTLs(t *testing.T) {
+	icmp := []SuspectHop{{TTL: 5, Confidence: 0.8, Source: "icmp", Evidence: "icmp evidence"}}
+	tcp := []SuspectHop{{TTL: 9, Confidence: 0.6, Source: "tcp", Evidence: "tcp evidence"}}
+	merged := MergeSuspects(icmp, tcp)
+	if len(merged) != 2 {
+		t.Fatalf("want 2 distinct suspects, got %d (%+v)", len(merged), merged)
+	}
+	// Sorted by confidence desc, so TTL 5 (icmp, 0.8) comes first.
+	if merged[0].TTL != 5 || merged[0].Source != "icmp" {
+		t.Errorf("first should be ICMP TTL 5, got %+v", merged[0])
+	}
+	if merged[1].TTL != 9 || merged[1].Source != "tcp" {
+		t.Errorf("second should be TCP TTL 9, got %+v", merged[1])
+	}
+}
+
+func TestMergeSuspectsEmpty(t *testing.T) {
+	if got := MergeSuspects(nil, nil); got != nil {
+		t.Errorf("want nil for empty inputs, got %+v", got)
+	}
+}

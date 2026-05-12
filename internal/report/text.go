@@ -73,6 +73,10 @@ func RenderText(w io.Writer, d Data) error {
 		}
 	}
 
+	if t := d.TCPHopProbe; t != nil {
+		writeTCPHopProbe(&sb, t)
+	}
+
 	if r := d.ReverseStream; r != nil {
 		sb.WriteString("\nreverse udp stream (server→client):\n")
 		fmt.Fprintf(&sb, "  sent (server):%d\n", r.Sent)
@@ -183,12 +187,72 @@ func leadingFilteredHint(hops []ReverseHopReport) string {
 // writeSuspectHops renders the correlator's ranked suspect-hop list when
 // non-empty. Skipped silently otherwise — the JSON output is the
 // authoritative consumer; the text section is just operator-friendly.
+// Source ("icmp", "tcp", "icmp+tcp") is appended in brackets when
+// non-default so the operator can see which probe(s) flagged the hop.
 func writeSuspectHops(sb *strings.Builder, d Data) {
 	if len(d.Correlation) == 0 {
 		return
 	}
 	sb.WriteString("\nsuspect hops:\n")
 	for _, h := range d.Correlation {
-		fmt.Fprintf(sb, "  ttl=%d  confidence=%.2f  %s\n", h.TTL, h.Confidence, h.Evidence)
+		src := h.Source
+		if src == "" || src == "icmp" {
+			fmt.Fprintf(sb, "  ttl=%d  confidence=%.2f  %s\n", h.TTL, h.Confidence, h.Evidence)
+			continue
+		}
+		fmt.Fprintf(sb, "  ttl=%d  confidence=%.2f  [%s]  %s\n", h.TTL, h.Confidence, src, h.Evidence)
+	}
+}
+
+// writeTCPHopProbe renders the TCP-mode hop probe section. Mirrors the
+// forward + reverse ICMP sections — same column layout, same loss-cell
+// formatting for silent hops — labeled with the probed destination
+// port. When the platform doesn't support TCP-mode probing (Windows),
+// emits a one-line notice in place of the hop tables.
+func writeTCPHopProbe(sb *strings.Builder, t *TCPHopProbeReport) {
+	fmt.Fprintf(sb, "\ntcp hop probe (port %d):\n", t.Port)
+	if !t.Supported {
+		sb.WriteString("  unsupported on this host (raw-ICMP TCP demux unavailable)\n")
+		return
+	}
+	if len(t.ForwardHops) > 0 {
+		sb.WriteString("  forward:\n")
+		fmt.Fprintf(sb, "    %-3s  %-15s  %5s  %5s  %11s  %7s  %7s  %7s  %7s  %7s\n",
+			"TTL", "IP", "Sent", "Recv", "TCP Loss%", "Last", "Best", "Worst", "Avg", "StDev")
+		for _, h := range t.ForwardHops {
+			ip := h.IP
+			if ip == "" {
+				ip = "*"
+			}
+			var lossCell string
+			if h.IP == "" {
+				lossCell = fmt.Sprintf("%11s", "—")
+			} else {
+				lossCell = fmt.Sprintf("%10.2f%%", h.LossPct)
+			}
+			fmt.Fprintf(sb, "    %-3d  %-15s  %5d  %5d  %s  %7.2f  %7.2f  %7.2f  %7.2f  %7.2f\n",
+				h.TTL, ip, h.Sent, h.Recv, lossCell,
+				h.LastRTTMS, h.BestRTTMS, h.WorstRTTMS, h.AvgRTTMS, h.StdDevRTTMS)
+		}
+	}
+	if len(t.ReverseHops) > 0 {
+		sb.WriteString("  reverse:\n")
+		fmt.Fprintf(sb, "    %-3s  %-15s  %5s  %5s  %11s  %7s  %7s  %7s  %7s\n",
+			"TTL", "Addr", "Sent", "Recv", "TCP Loss%", "Last", "Best", "Worst", "Avg")
+		for _, h := range t.ReverseHops {
+			addr := h.Addr
+			if addr == "" {
+				addr = "*"
+			}
+			var lossCell string
+			if h.Addr == "" {
+				lossCell = fmt.Sprintf("%11s", "—")
+			} else {
+				lossCell = fmt.Sprintf("%10.2f%%", h.LossPct)
+			}
+			fmt.Fprintf(sb, "    %-3d  %-15s  %5d  %5d  %s  %7.2f  %7.2f  %7.2f  %7.2f\n",
+				h.TTL, addr, h.Sent, h.Recv, lossCell,
+				h.RTTMS, h.BestRTTMS, h.WorstRTTMS, h.AvgRTTMS)
+		}
 	}
 }

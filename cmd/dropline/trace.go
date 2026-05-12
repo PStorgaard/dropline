@@ -105,6 +105,8 @@ type traceConfig struct {
 	reverseStream      reverseTraceMode
 	tcpCorroborate     reverseTraceMode
 	tcpCorroborateRate int64 // bps
+	tcpHopProbe        reverseTraceMode
+	tcpHopProbePort    uint16
 }
 
 func parseTraceArgs(args []string, stdoutIsTTY bool, errOut io.Writer) (traceConfig, error) {
@@ -124,6 +126,8 @@ func parseTraceArgs(args []string, stdoutIsTTY bool, errOut io.Writer) (traceCon
 	reverseStream := fs.String("reverse-stream", "auto", "reverse-direction UDP loss test: on, off, or auto")
 	tcpCorroborate := fs.String("tcp-corroborate", "auto", "TCP retransmit corroboration probe: on, off, or auto")
 	tcpCorroborateRate := fs.String("tcp-corroborate-rate", "100K", "TCP corroboration probe rate (bps; suffixes K/M/G accepted)")
+	tcpHopProbe := fs.String("tcp-hop-probe", "off", "TCP-mode hop probing (SYN+TTL): on, off, or auto (auto resolves to off in v1)")
+	tcpHopProbePort := fs.Int("tcp-hop-probe-port", 443, "destination port for the TCP-mode hop probes (when --tcp-hop-probe=on)")
 
 	// Stdlib flag.Parse stops at the first non-flag token, but the spec
 	// puts TARGET before flags (`dropline trace TARGET --rate ...`).
@@ -180,6 +184,13 @@ func parseTraceArgs(args []string, stdoutIsTTY bool, errOut io.Writer) (traceCon
 	if err != nil {
 		return traceConfig{}, fmt.Errorf("--tcp-corroborate-rate: %w", err)
 	}
+	tcpHop, err := parseTCPHopProbe(*tcpHopProbe)
+	if err != nil {
+		return traceConfig{}, err
+	}
+	if tcpHop == reverseOn && (*tcpHopProbePort < 1 || *tcpHopProbePort > 65535) {
+		return traceConfig{}, fmt.Errorf("--tcp-hop-probe-port must be in [1,65535] when --tcp-hop-probe=on, got %d", *tcpHopProbePort)
+	}
 
 	if *packetSize < 32 {
 		return traceConfig{}, fmt.Errorf("--packet-size must be >= 32 (stream header is 32 bytes), got %d", *packetSize)
@@ -211,6 +222,8 @@ func parseTraceArgs(args []string, stdoutIsTTY bool, errOut io.Writer) (traceCon
 		reverseStream:      revStream,
 		tcpCorroborate:     tcpCorr,
 		tcpCorroborateRate: tcpCorrRate,
+		tcpHopProbe:        tcpHop,
+		tcpHopProbePort:    uint16(*tcpHopProbePort), // #nosec G115 -- bounds-checked above when tcpHop==on
 	}, nil
 }
 
@@ -361,6 +374,23 @@ func parseTCPCorroborate(raw string) (reverseTraceMode, error) {
 	}
 }
 
+// parseTCPHopProbe mirrors parseReverseTrace for the --tcp-hop-probe
+// flag. Same three-mode semantics (auto/on/off). "auto" resolves to
+// "off" client-side in v1 — opt-in is the safer default given TCP SYN
+// bursts can trip IDS/firewalls.
+func parseTCPHopProbe(raw string) (reverseTraceMode, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "auto":
+		return reverseAuto, nil
+	case "on":
+		return reverseOn, nil
+	case "off":
+		return reverseOff, nil
+	default:
+		return 0, fmt.Errorf("--tcp-hop-probe must be on, off, or auto; got %q", raw)
+	}
+}
+
 func stdoutIsTTY() bool {
 	fi, err := os.Stdout.Stat()
 	if err != nil {
@@ -451,6 +481,14 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 	if cfg.tcpCorroborate == reverseOff {
 		tcpCorrRateOnWire = 0
 	}
+	// Only advertise tcp_hop_probe_port on the wire when the feature is
+	// enabled — otherwise the server's validateHello may reject a
+	// zero/non-zero port mismatch and the omitempty wire shape stays
+	// byte-identical to legacy clients.
+	tcpHopProbePortOnWire := uint16(0)
+	if cfg.tcpHopProbe == reverseOn {
+		tcpHopProbePortOnWire = cfg.tcpHopProbePort
+	}
 	hello := &control.Hello{
 		Type:                  control.TypeHello,
 		Version:               1,
@@ -466,6 +504,8 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 		TCPCorroborate:        cfg.tcpCorroborate.String(),
 		TCPCorroborateRateBPS: tcpCorrRateOnWire,
 		Token:                 token,
+		TCPHopProbe:           cfg.tcpHopProbe.String(),
+		TCPHopProbePort:       tcpHopProbePortOnWire,
 	}
 	if err := cc.Send(hello); err != nil {
 		return fmt.Errorf("send hello: %w", err)
@@ -491,6 +531,12 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 			reverseStreamOn = true
 		}
 		tcpCorroborateOn = (m.TCPCorroborate == "on")
+		// m.TCPHopProbe reflects the server's resolved decision. The
+		// client doesn't need to gate on it explicitly: if the server
+		// declined, no ReverseTCPHopUpdate messages will arrive, and
+		// the aggregator simply won't populate the reverse-TCP table.
+		// Forward-direction TCP-mode probing runs from this client's
+		// own raw socket regardless of the server's reverse decision.
 		sessionID = m.SessionID
 	case *control.Error:
 		return fmt.Errorf("server rejected session: %s", m.Reason)
@@ -523,6 +569,27 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 		return fmt.Errorf("init prober: %w", err)
 	}
 	defer func() { _ = prober.Close() }()
+
+	// TCP-mode hop prober: opt-in. Opens its own raw ICMP socket on
+	// Linux/macOS to demux TimeExceeded responses by embedded TCP
+	// source port. On Windows the constructor succeeds but Run() emits
+	// a single Supported=false snapshot so the renderer can show
+	// "(unsupported on Windows)" without an empty-table guess.
+	var tcpProber *probe.TCPProber
+	var tcpProbeSnaps chan probe.TCPSnapshot
+	if cfg.tcpHopProbe == reverseOn {
+		tcpProbeSnaps = make(chan probe.TCPSnapshot, 4)
+		tcpProber, err = probe.NewTCP(probe.TCPConfig{
+			Target:      udpAddr.IP,
+			Port:        cfg.tcpHopProbePort,
+			MTRInterval: cfg.mtrInterval,
+			MaxHops:     cfg.maxHops,
+		}, tcpProbeSnaps)
+		if err != nil {
+			return fmt.Errorf("init tcp hop prober: %w", err)
+		}
+		defer func() { _ = tcpProber.Close() }()
+	}
 
 	// Pause gate is shared between the sender (which blocks on it) and
 	// the TUI's [p] keybinding callback (which toggles it). Always
@@ -589,6 +656,32 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 			}
 		}
 	}()
+
+	// TCP-mode prober mirrors the ICMP prober's lifecycle. Errors from
+	// TCPProber.Run are logged but don't abort the test — TCP-mode hop
+	// probing is a best-effort enhancement, and a sockopt rejection on
+	// an exotic kernel shouldn't break the rest of the diagnostic.
+	if tcpProber != nil {
+		workersWG.Add(1)
+		go func() {
+			defer workersWG.Done()
+			if err := tcpProber.Run(workerCtx); err != nil && !errors.Is(err, context.Canceled) {
+				fmt.Fprintf(os.Stderr, "dropline trace: tcp hop prober: %s\n", err)
+			}
+		}()
+		workersWG.Add(1)
+		go func() {
+			defer workersWG.Done()
+			for {
+				select {
+				case <-workerCtx.Done():
+					return
+				case s := <-tcpProbeSnaps:
+					aggregator.IngestForwardTCPHop(s)
+				}
+			}
+		}()
+	}
 
 	// Reverse-direction UDP stream: when the server agreed to send back
 	// (Ready.ReverseStream == "on"), open a Receiver on the SAME dialed
@@ -657,16 +750,20 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 	// cheap (Correlate is pure) and yields the same Data.
 	buildReportData := func(f *control.Final) report.Data {
 		finalState := aggregator.Snapshot()
-		suspects := agg.Correlate(finalState.Buckets, finalState.LatestForwardHops)
-		ttls := make([]int, len(suspects))
-		for i, s := range suspects {
-			ttls[i] = s.TTL
+		icmpSuspects := agg.Correlate(finalState.Buckets, finalState.LatestForwardHops)
+		var tcpSuspects []agg.SuspectHop
+		if cfg.tcpHopProbe == reverseOn && finalState.TCPHopProbeSupported {
+			tcpSuspects = agg.CorrelateTCP(finalState.Buckets, finalState.LatestForwardTCPHops)
 		}
+		mergedSuspects := agg.MergeSuspects(icmpSuspects, tcpSuspects)
+		icmpTTLs := suspectTTLsForSource(mergedSuspects, "icmp")
+		tcpTTLs := suspectTTLsForSource(mergedSuspects, "tcp")
 		// MarkSuspects mutates the aggregator's stored hops and emits a
 		// fresh StateSnapshot so a live TUI sees suspect highlights on
 		// its test-complete view (the snaps channel is still open at
 		// this call site for the TUI flow).
-		aggregator.MarkSuspects(ttls)
+		aggregator.MarkSuspects(icmpTTLs)
+		aggregator.MarkTCPSuspects(tcpTTLs)
 		finalState = aggregator.Snapshot()
 		return report.Data{
 			Version:   1,
@@ -682,15 +779,18 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 				ReverseStream:         cfg.reverseStream.String(),
 				TCPCorroborate:        cfg.tcpCorroborate.String(),
 				TCPCorroborateRateBPS: cfg.tcpCorroborateRate,
+				TCPHopProbe:           cfg.tcpHopProbe.String(),
+				TCPHopProbePort:       cfg.tcpHopProbePort,
 			},
 			Stream:            f.Stats,
 			Timeline:          finalState.Buckets,
 			Hops:              hopsFromAgg(finalState.LatestForwardHops),
 			ReversePath:       reverseHopsFromAgg(finalState.LatestReverseHops),
 			ReversePathStatus: finalState.ReversePathStatus,
-			Correlation:       suspectsToReports(suspects),
+			Correlation:       suspectsToReports(mergedSuspects),
 			ReverseStream:     reverseStreamReport(finalState.ReverseStream, &f.Stats),
 			TCPCorroborate:    tcpCorroborateReport(finalState.TCPCorroborate),
+			TCPHopProbe:       tcpHopProbeReport(finalState),
 		}
 	}
 
@@ -859,6 +959,8 @@ func runRecvLoop(cc *control.Conn, aggregator *agg.Aggregator) (*control.Final, 
 			return nil, m.Reason, nil
 		case *control.ReverseHopUpdate:
 			aggregator.IngestReverseHop(*m)
+		case *control.ReverseTCPHopUpdate:
+			aggregator.IngestReverseTCPHop(*m)
 		default:
 			// Future message types: ignore so we stay forward-compatible.
 		}
@@ -1145,6 +1247,9 @@ func tcpCorroborateReport(v *agg.TCPCorroborateView) *report.TCPCorroborateRepor
 // suspectsToReports adapts the agg correlator's output into the renderer's
 // SuspectHopReport shape. Returns nil for empty input so the report's
 // Correlation field stays empty (the JSON renderer turns nil into `[]`).
+// Source is propagated verbatim ("icmp", "tcp", "icmp+tcp"); the
+// renderer omits it from the JSON when it would just be "icmp" (legacy
+// shape).
 func suspectsToReports(in []agg.SuspectHop) []report.SuspectHopReport {
 	if len(in) == 0 {
 		return nil
@@ -1155,9 +1260,44 @@ func suspectsToReports(in []agg.SuspectHop) []report.SuspectHopReport {
 			TTL:        s.TTL,
 			Confidence: s.Confidence,
 			Evidence:   s.Evidence,
+			Source:     s.Source,
 		}
 	}
 	return out
+}
+
+// suspectTTLsForSource extracts the TTLs that should be marked suspect
+// in the given source's hop table. An "icmp+tcp" merged suspect counts
+// for both sources. Used by buildReportData to drive
+// Aggregator.MarkSuspects + MarkTCPSuspects so the live TUI's test-
+// complete view highlights the same hops as the report's correlation
+// section.
+func suspectTTLsForSource(suspects []agg.SuspectHop, source string) []int {
+	out := make([]int, 0, len(suspects))
+	for _, s := range suspects {
+		if s.Source == source || s.Source == "icmp+tcp" {
+			out = append(out, s.TTL)
+		}
+	}
+	return out
+}
+
+// tcpHopProbeReport builds the renderer's TCP-hop-probe view from the
+// aggregator's last-known state. Returns nil when the feature was off
+// for this session (TCPHopProbePort == 0). When the platform doesn't
+// support TCP-mode probing (Windows) the report carries
+// Supported=false so the renderer can show an "unsupported" notice
+// distinct from "no hops resolved yet".
+func tcpHopProbeReport(s agg.StateSnapshot) *report.TCPHopProbeReport {
+	if s.TCPHopProbePort == 0 {
+		return nil
+	}
+	return &report.TCPHopProbeReport{
+		Supported:   s.TCPHopProbeSupported,
+		Port:        s.TCPHopProbePort,
+		ForwardHops: hopsFromAgg(s.LatestForwardTCPHops),
+		ReverseHops: reverseHopsFromAgg(s.LatestReverseTCPHops),
+	}
 }
 
 // makeSaveFn returns the closure passed to tui.Options.SaveFn. The TUI

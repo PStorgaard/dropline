@@ -11,7 +11,13 @@ const (
 	TypeStats            Type = "stats"
 	TypeFinal            Type = "final"
 	TypeReverseHopUpdate Type = "reverse_hop_update"
-	TypePause            Type = "pause"
+	// TypeReverseTCPHopUpdate is the server→client equivalent of
+	// TypeReverseHopUpdate for the TCP-mode hop prober. Distinct type
+	// (rather than a Source enum on ReverseHopUpdate) so old clients
+	// without TCP-hop awareness silently ignore the message instead of
+	// rendering it as an ICMP hop.
+	TypeReverseTCPHopUpdate Type = "reverse_tcp_hop_update"
+	TypePause               Type = "pause"
 	// TypeTCPProbe is sent by a client opening a *second* TCP connection
 	// to the dropline server port for TCP retransmit corroboration. The
 	// server's accept loop dispatches by first-message type: Hello → a
@@ -100,6 +106,20 @@ type Hello struct {
 	// Token=0 is reserved as "no token" and is rejected at admission
 	// time by validateHello.
 	Token uint64 `json:"token,omitempty"`
+	// TCPHopProbe is the client's TCP-mode hop-probe preference: "on",
+	// "off", or "auto". When resolved "on", the client runs a parallel
+	// TCP SYN+TTL prober alongside the ICMP one and (if the server also
+	// agrees) ingests reverse-direction TCP hop updates over the
+	// control channel. Empty/absent (old client) → server treats as
+	// "off". v1 resolves "auto" to "off" client-side; future revisions
+	// may upgrade it.
+	TCPHopProbe string `json:"tcp_hop_probe,omitempty"`
+	// TCPHopProbePort is the destination port the client's TCP-mode
+	// prober targets. The server uses it both for validation (must be
+	// non-zero when TCPHopProbe=="on") and for the reverse-direction
+	// prober's destination toward the client. Zero/absent (old client
+	// or TCP-hop off) is the disabled state.
+	TCPHopProbePort uint16 `json:"tcp_hop_probe_port,omitempty"`
 }
 
 // Ready acknowledges a Hello and carries the server-assigned session ID.
@@ -124,6 +144,13 @@ type Ready struct {
 	// for this session, "off" otherwise. Empty/absent (old server) means
 	// "off" to a new client.
 	TCPCorroborate string `json:"tcp_corroborate,omitempty"`
+	// TCPHopProbe is the server's resolved decision: "on" if the server
+	// will run a reverse-direction TCP-mode hop prober and stream
+	// ReverseTCPHopUpdate messages during this session, "off"
+	// otherwise. Server-side raw-ICMP capability gates this exactly the
+	// same way it gates ReverseTrace. Empty/absent (old server) means
+	// "off" to a new client.
+	TCPHopProbe string `json:"tcp_hop_probe,omitempty"`
 }
 
 // Error reports a session-fatal condition (server busy, version mismatch, …).
@@ -248,6 +275,31 @@ type ReverseHopUpdate struct {
 	MaxTTL int `json:"max_ttl,omitempty"`
 }
 
+// ReverseTCPHopUpdate is the server→client message for the TCP-mode
+// reverse hop prober. Wire shape mirrors ReverseHopUpdate field-for-
+// field plus a Port field so the renderer can label the section with
+// the probed destination port. Distinct type rather than a Source
+// discriminator on ReverseHopUpdate so an old client (with no TCP-hop
+// awareness) silently ignores these via ReadMessage's "unknown type"
+// path instead of rendering them as ICMP hops.
+type ReverseTCPHopUpdate struct {
+	Type          Type    `json:"type"`
+	TTL           int     `json:"ttl"`
+	Addr          string  `json:"addr"`
+	Port          uint16  `json:"port,omitempty"`
+	RTTMS         float64 `json:"rtt_ms"`
+	LossPct       float64 `json:"loss_pct"`
+	Terminus      string  `json:"terminus,omitempty"`
+	Sent          int64   `json:"sent,omitempty"`
+	Recv          int64   `json:"recv,omitempty"`
+	BestRTTMS     float64 `json:"rtt_ms_best,omitempty"`
+	WorstRTTMS    float64 `json:"rtt_ms_worst,omitempty"`
+	AvgRTTMS      float64 `json:"rtt_ms_avg,omitempty"`
+	StdDevRTTMS   float64 `json:"rtt_ms_stddev,omitempty"`
+	BaselineRTTMS float64 `json:"rtt_ms_baseline,omitempty"`
+	MaxTTL        int     `json:"max_ttl,omitempty"`
+}
+
 // TCPProbe is the first message a client sends on a *second* TCP
 // connection to the dropline server port, opted-in via Hello's
 // TCPCorroborate. The server's accept loop dispatches by first-message
@@ -289,6 +341,7 @@ func (*Ready) controlMessage()            {}
 func (*Error) controlMessage()            {}
 func (*Stats) controlMessage()            {}
 func (*Final) controlMessage()            {}
-func (*ReverseHopUpdate) controlMessage() {}
-func (*Pause) controlMessage()            {}
-func (*TCPProbe) controlMessage()         {}
+func (*ReverseHopUpdate) controlMessage()    {}
+func (*ReverseTCPHopUpdate) controlMessage() {}
+func (*Pause) controlMessage()               {}
+func (*TCPProbe) controlMessage()            {}

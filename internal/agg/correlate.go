@@ -11,16 +11,24 @@ import (
 // loss crossed its threshold (range (0.5, 1.0]). Evidence is a short
 // human-readable string suitable for the JSON `evidence` field and the
 // text renderer's "suspect hops:" line.
+//
+// Source is the probe source that produced the suspect score: "icmp"
+// for the default ICMP TTL-walker, "tcp" for the TCP-mode hop prober,
+// or "icmp+tcp" when MergeSuspects has merged matching TTLs from both
+// sources (the strongest verdict — both protocols see the same hop
+// dropping). Empty Source on legacy code paths is treated as "icmp".
 type SuspectHop struct {
 	TTL        int
 	Confidence float64
 	Evidence   string
+	Source     string
 }
 
 // Correlate runs the spec § Aggregator + correlation algorithm against
-// the finalized timeline and the per-hop final state. Returns the suspect
-// hops ranked by confidence (descending). Empty slice when there are no
-// loss events, no hops, or no hop crosses the >50% co-occurrence bar.
+// the finalized timeline and the per-hop final ICMP state. Returns the
+// suspect hops ranked by confidence (descending). Empty slice when there
+// are no loss events, no hops, or no hop crosses the >50% co-occurrence
+// bar.
 //
 // The algorithm:
 //  1. Loss-event detection — bucket is a loss event if its
@@ -38,8 +46,30 @@ type SuspectHop struct {
 // The correlator is pure: no aggregator state mutation, no IO. Caller
 // (typically the trace driver at end-of-test) is responsible for
 // flipping per-hop Suspect flags and feeding the result to the
-// renderers.
+// renderers. Suspect.Source is set to "icmp".
 func Correlate(buckets []Bucket, finalHops []HopView) []SuspectHop {
+	return correlateImpl(buckets, finalHops, func(b Bucket) []HopView { return b.Hops }, "icmp")
+}
+
+// CorrelateTCP mirrors Correlate but reads each bucket's TCPHops
+// snapshot instead of Hops. Loss-event detection is shared (same
+// stream-loss buckets); per-hop scoring uses the TCP-mode prober's
+// per-bucket samples. Suspect.Source is set to "tcp".
+//
+// Callers typically run both Correlate and CorrelateTCP at end-of-test
+// and pass the two slices through MergeSuspects, which folds matching
+// TTLs into an "icmp+tcp" verdict (the strongest evidence).
+func CorrelateTCP(buckets []Bucket, finalHops []HopView) []SuspectHop {
+	return correlateImpl(buckets, finalHops, func(b Bucket) []HopView { return b.TCPHops }, "tcp")
+}
+
+// correlateImpl is the shared implementation of Correlate and
+// CorrelateTCP. The bucketHops accessor picks which per-bucket hop
+// slice to score against (Hops vs TCPHops); everything else is
+// identical, including the RateLimitedICMP suppression — a router
+// throttling its TimeExceeded generation does the same thing whether
+// the inner packet was ICMP or TCP.
+func correlateImpl(buckets []Bucket, finalHops []HopView, bucketHops func(Bucket) []HopView, source string) []SuspectHop {
 	if len(buckets) == 0 || len(finalHops) == 0 {
 		return nil
 	}
@@ -47,18 +77,8 @@ func Correlate(buckets []Bucket, finalHops []HopView) []SuspectHop {
 	for i, b := range buckets {
 		losses[i] = b.StreamLossPct
 	}
-	// Floor at 1.0% per second: a clean test with overall loss well under
-	// 1% can still have individual seconds spiking to 0.5–1% (one packet
-	// in a few hundred). Those aren't operationally interesting, but at
-	// 0.5% the floor catches them and any RTT variance on a slow path
-	// reads as a correlated suspect. 1% requires a real glitch in that
-	// second before the correlator considers it.
 	threshold := math.Max(1.0, percentile(losses, 0.95))
 
-	// We use ≥ rather than strict > so a uniform-loss timeline (every
-	// second showing the same loss) still surfaces correlation. Strict
-	// > would yield zero loss events in that case despite a clear
-	// signal, because the spike's own value sets p95.
 	var lossEvents []Bucket
 	for _, b := range buckets {
 		if b.StreamLossPct >= threshold {
@@ -77,19 +97,11 @@ func Correlate(buckets []Bucket, finalHops []HopView) []SuspectHop {
 	}
 	scores := make(map[int]*hopScore, len(finalHops))
 	for i, h := range finalHops {
-		// Silent hops carry no usable signal: their bucket-snapshot
-		// LossPct is 100% (they never reply), which would otherwise trip
-		// the loss check on every event and falsely flag every star — a
-		// router filtering ICMP is not the same as one losing your
-		// packets. Skip them entirely; the renderer dims them anyway.
 		if h.IP == "" {
 			continue
 		}
 		scores[h.TTL] = &hopScore{
-			rttBaseline: h.AvgRTTMS + 3*h.StdDevRTTMS,
-			// Suppress the loss signal when the data plane contradicts
-			// it. The RTT signal stays — actual queueing delay shows up
-			// regardless of ICMP throttling.
+			rttBaseline:  h.AvgRTTMS + 3*h.StdDevRTTMS,
 			suppressLoss: RateLimitedICMP(finalHops, i),
 		}
 	}
@@ -98,7 +110,7 @@ func Correlate(buckets []Bucket, finalHops []HopView) []SuspectHop {
 	}
 
 	for _, b := range lossEvents {
-		for _, bh := range b.Hops {
+		for _, bh := range bucketHops(b) {
 			sc, ok := scores[bh.TTL]
 			if !ok {
 				continue
@@ -130,12 +142,79 @@ func Correlate(buckets []Bucket, finalHops []HopView) []SuspectHop {
 			TTL:        h.TTL,
 			Confidence: conf,
 			Evidence:   formatEvidence(sc.rttHits, sc.lossHits, len(lossEvents), sc.rttBaseline),
+			Source:     source,
 		})
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		return out[i].Confidence > out[j].Confidence
 	})
 	return out
+}
+
+// MergeSuspects combines the ICMP and TCP correlator outputs into a
+// single ranked list. TTLs flagged by both correlators are folded into
+// one entry with Source="icmp+tcp", Confidence = max of the two, and
+// Evidence reading "RTT/loss correlated in both ICMP and TCP probes"
+// — the strongest verdict the correlator can produce. TTLs flagged by
+// only one source keep that source's confidence and evidence. Result
+// is sorted by Confidence descending; "icmp+tcp" entries break ties
+// against single-source entries.
+func MergeSuspects(icmp, tcp []SuspectHop) []SuspectHop {
+	if len(icmp) == 0 && len(tcp) == 0 {
+		return nil
+	}
+	byTTL := make(map[int]SuspectHop, len(icmp)+len(tcp))
+	for _, s := range icmp {
+		if s.Source == "" {
+			s.Source = "icmp"
+		}
+		byTTL[s.TTL] = s
+	}
+	for _, s := range tcp {
+		if s.Source == "" {
+			s.Source = "tcp"
+		}
+		if existing, ok := byTTL[s.TTL]; ok {
+			// Same TTL flagged by both — upgrade to the joint verdict.
+			conf := existing.Confidence
+			if s.Confidence > conf {
+				conf = s.Confidence
+			}
+			byTTL[s.TTL] = SuspectHop{
+				TTL:        s.TTL,
+				Confidence: conf,
+				Evidence:   "RTT/loss correlated in both ICMP and TCP probes",
+				Source:     "icmp+tcp",
+			}
+			continue
+		}
+		byTTL[s.TTL] = s
+	}
+	out := make([]SuspectHop, 0, len(byTTL))
+	for _, v := range byTTL {
+		out = append(out, v)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Confidence != out[j].Confidence {
+			return out[i].Confidence > out[j].Confidence
+		}
+		// Tie-breaker: "icmp+tcp" outranks single-source so the strongest
+		// evidence floats to the top.
+		return sourceRank(out[i].Source) < sourceRank(out[j].Source)
+	})
+	return out
+}
+
+func sourceRank(s string) int {
+	switch s {
+	case "icmp+tcp":
+		return 0
+	case "tcp":
+		return 1
+	case "icmp":
+		return 2
+	}
+	return 3
 }
 
 // RateLimitedICMP reports whether hops[i]'s elevated final ICMP loss is
