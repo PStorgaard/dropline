@@ -141,6 +141,12 @@ func (r *Receiver) Run(ctx context.Context) (Snapshot, error) {
 	}
 	r.acc = NewAccumulator(t0)
 
+	// Wrap the configured sampler so kernel_drops reports the delta
+	// over the test window. The underlying samplers read host-wide
+	// protocol counters; without baselining they'd inherit pre-test
+	// drops and drops from unrelated UDP sockets.
+	kernelDrops := newBaselineSampler(r.cfg.KernelDrops)
+
 	var (
 		obsCh       <-chan observation
 		drainerErr  atomic.Value
@@ -193,7 +199,7 @@ loop:
 			break loop
 		case t := <-tickC:
 			r.applyHubLocalDrops()
-			if n, err := r.cfg.KernelDrops.Sample(); err == nil {
+			if n, err := kernelDrops.Sample(); err == nil {
 				r.acc.SetKernelDrops(n)
 			}
 			select {

@@ -24,9 +24,15 @@ type Conn struct {
 
 // Dial establishes a TCP control connection. The returned *Conn owns the
 // underlying net.Conn until Close is called.
+//
+// v1 is IPv4-only by spec, and the UDP stream + ICMP probe paths both
+// pin to IPv4. Forcing "tcp4" here keeps the control channel from
+// silently splitting onto IPv6 (or a different A record under
+// round-robin DNS) when the caller passes a hostname rather than a
+// pre-resolved IPv4.
 func Dial(ctx context.Context, addr string) (*Conn, error) {
 	var d net.Dialer
-	nc, err := d.DialContext(ctx, "tcp", addr)
+	nc, err := d.DialContext(ctx, "tcp4", addr)
 	if err != nil {
 		return nil, err
 	}

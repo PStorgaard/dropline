@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"io"
 	"math"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -312,6 +313,45 @@ func TestNormalizeTarget(t *testing.T) {
 	}
 	if _, err := normalizeTarget(""); err == nil {
 		t.Error("normalizeTarget(\"\"): expected error")
+	}
+}
+
+func TestResolveTargetIPv4(t *testing.T) {
+	// Bare IPv4 round-trips without a DNS lookup — net.LookupIP on a
+	// dotted-quad returns the literal address.
+	got, err := resolveTargetIPv4("1.2.3.4:5301")
+	if err != nil {
+		t.Fatalf("bare v4: %v", err)
+	}
+	if got != "1.2.3.4:5301" {
+		t.Errorf("bare v4: got %q, want 1.2.3.4:5301", got)
+	}
+
+	// localhost is dual-stack on most systems; we must always pick the
+	// IPv4 form so the rest of the trace pipeline (udp4, tcp4) lines up.
+	got, err = resolveTargetIPv4("localhost:5301")
+	if err != nil {
+		t.Fatalf("localhost: %v", err)
+	}
+	host, _, err := net.SplitHostPort(got)
+	if err != nil {
+		t.Fatalf("split %q: %v", got, err)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || ip.To4() == nil {
+		t.Errorf("localhost resolved to %q, want an IPv4 address", host)
+	}
+
+	// IPv6 literal has no IPv4 form — must surface a clear error rather
+	// than fall through to a bogus address.
+	if _, err := resolveTargetIPv4("[::1]:5301"); err == nil {
+		t.Error("IPv6 literal: expected error, got nil")
+	}
+
+	// Malformed input (no port) should surface a split error rather
+	// than panic.
+	if _, err := resolveTargetIPv4("noport"); err == nil {
+		t.Error("missing port: expected error, got nil")
 	}
 }
 

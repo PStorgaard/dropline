@@ -116,7 +116,10 @@ func serveRun(ctx context.Context, cfg serveConfig) error {
 	}
 	defer func() { _ = udpConn.Close() }()
 
-	tcpLn, err := net.Listen("tcp", cfg.listen)
+	// "tcp4" mirrors the udp4 listener above; v1 is IPv4-only and we
+	// want both sockets bound to the same family so a hostname-style
+	// --listen can't bind TCP on IPv6 while UDP sits on IPv4.
+	tcpLn, err := net.Listen("tcp4", cfg.listen)
 	if err != nil {
 		return fmt.Errorf("listen tcp %s: %w", cfg.listen, err)
 	}
@@ -147,23 +150,60 @@ func serveRun(ctx context.Context, cfg serveConfig) error {
 
 	// One Hub demultiplexes UDP packets by flow_id across all concurrent
 	// sessions. Its Run goroutine is the single ReadFromUDP caller for
-	// the lifetime of the server; cancelling ctx unblocks Read via the
-	// drainer-shutdown deadline trick.
+	// the lifetime of the server; cancelling serveCtx unblocks Read via
+	// the drainer-shutdown deadline trick.
 	hub := stream.NewHub(udpConn)
-	hubDone := make(chan struct{})
-	go func() {
-		defer close(hubDone)
-		_ = hub.Run(ctx)
-	}()
 
 	reg := newSessionRegistry()
 	srv := &control.Server{
 		Handler:      newServeHandler(hub, rawICMP.OK, cfg.maxSessions, cfg.maxRateBPS, cfg.allowReverseStream, reg),
 		ProbeHandler: newProbeHandler(reg, cfg.maxSessions),
 	}
-	err = srv.Serve(ctx, tcpLn)
-	<-hubDone
-	return err
+
+	return runServerLoops(ctx,
+		func(c context.Context) error { return hub.Run(c) },
+		func(c context.Context) error { return srv.Serve(c, tcpLn) },
+	)
+}
+
+// runServerLoops drives the UDP hub and TCP accept loop as a single
+// failure domain. Without this coupling, a fatal accept error from the
+// TCP loop would leave hub.Run running on the parent ctx forever, and a
+// hub read failure would let TCP keep admitting sessions that can never
+// receive UDP. Either loop's exit cancels the other; the first
+// non-context error wins and propagates back to the caller.
+func runServerLoops(ctx context.Context, hubRun, tcpServe func(context.Context) error) error {
+	serveCtx, serveCancel := context.WithCancel(ctx)
+	defer serveCancel()
+
+	var (
+		wg       sync.WaitGroup
+		firstErr atomic.Value // holds error
+	)
+	fail := func(err error) {
+		if err != nil && !errors.Is(err, context.Canceled) {
+			firstErr.CompareAndSwap(nil, err)
+		}
+		serveCancel()
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		fail(hubRun(serveCtx))
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		fail(tcpServe(serveCtx))
+	}()
+
+	wg.Wait()
+	if e, _ := firstErr.Load().(error); e != nil {
+		return e
+	}
+	return nil
 }
 
 // newServeHandler returns a control.Handler that admits up to

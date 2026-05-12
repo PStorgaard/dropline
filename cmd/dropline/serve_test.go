@@ -1076,3 +1076,99 @@ func TestServeUnexpectedFirstMessage(t *testing.T) {
 		t.Fatalf("expected Error, got %#v", msg)
 	}
 }
+
+// runServerLoops must couple the hub and TCP loops as one failure
+// domain. The three cases below check the three ways that coupling can
+// matter: (1) context cancellation tears down both, (2) the hub side
+// failing cancels the TCP side and surfaces its error, (3) the TCP side
+// failing cancels the hub side and surfaces its error. Each subcase
+// must return promptly — the original bug was an indefinite block when
+// only one loop exited.
+func TestRunServerLoopsCoordinatedShutdown(t *testing.T) {
+	const settle = 2 * time.Second
+
+	t.Run("ctx_cancel_stops_both", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		hubExited, tcpExited := make(chan struct{}), make(chan struct{})
+		hubRun := func(c context.Context) error {
+			defer close(hubExited)
+			<-c.Done()
+			return nil
+		}
+		tcpServe := func(c context.Context) error {
+			defer close(tcpExited)
+			<-c.Done()
+			return nil
+		}
+		done := make(chan error, 1)
+		go func() { done <- runServerLoops(ctx, hubRun, tcpServe) }()
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("ctx cancel: want nil err, got %v", err)
+			}
+		case <-time.After(settle):
+			t.Fatal("runServerLoops did not return after ctx cancel")
+		}
+		// Both loops must have observed cancellation.
+		<-hubExited
+		<-tcpExited
+	})
+
+	t.Run("hub_failure_cancels_tcp", func(t *testing.T) {
+		want := errors.New("hub boom")
+		tcpExited := make(chan struct{})
+		hubRun := func(c context.Context) error {
+			return want
+		}
+		tcpServe := func(c context.Context) error {
+			defer close(tcpExited)
+			<-c.Done()
+			return nil
+		}
+		done := make(chan error, 1)
+		go func() { done <- runServerLoops(context.Background(), hubRun, tcpServe) }()
+		select {
+		case err := <-done:
+			if !errors.Is(err, want) {
+				t.Fatalf("want %v, got %v", want, err)
+			}
+		case <-time.After(settle):
+			t.Fatal("runServerLoops did not return after hub failure")
+		}
+		select {
+		case <-tcpExited:
+		default:
+			t.Fatal("tcp loop was not cancelled by hub failure")
+		}
+	})
+
+	t.Run("tcp_failure_cancels_hub", func(t *testing.T) {
+		want := errors.New("accept boom")
+		hubExited := make(chan struct{})
+		hubRun := func(c context.Context) error {
+			defer close(hubExited)
+			<-c.Done()
+			return nil
+		}
+		tcpServe := func(c context.Context) error {
+			return want
+		}
+		done := make(chan error, 1)
+		go func() { done <- runServerLoops(context.Background(), hubRun, tcpServe) }()
+		select {
+		case err := <-done:
+			if !errors.Is(err, want) {
+				t.Fatalf("want %v, got %v", want, err)
+			}
+		case <-time.After(settle):
+			t.Fatal("runServerLoops did not return after tcp failure")
+		}
+		select {
+		case <-hubExited:
+		default:
+			t.Fatal("hub loop was not cancelled by tcp failure")
+		}
+	})
+}

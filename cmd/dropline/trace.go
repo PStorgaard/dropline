@@ -229,6 +229,32 @@ func normalizeTarget(raw string) (string, error) {
 	return raw + ":" + defaultPort, nil
 }
 
+// resolveTargetIPv4 takes a normalized host:port and returns ip:port with
+// the host resolved to a single IPv4 address. We resolve once at the top
+// of traceRun so the TCP control channel, the UDP stream, and the ICMP
+// prober all see the same peer — without this, dual-stack DNS or
+// round-robin A records can split the three paths across different hosts
+// and the session looks healthy while data goes nowhere.
+//
+// Returns a clean error when the name has no IPv4 form (v6-only host) or
+// fails to resolve; the caller surfaces it to the operator.
+func resolveTargetIPv4(target string) (string, error) {
+	host, port, err := net.SplitHostPort(target)
+	if err != nil {
+		return "", fmt.Errorf("split host:port %q: %w", target, err)
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return "", fmt.Errorf("resolve %q: %w", host, err)
+	}
+	for _, ip := range ips {
+		if v4 := ip.To4(); v4 != nil {
+			return net.JoinHostPort(v4.String(), port), nil
+		}
+	}
+	return "", fmt.Errorf("resolve %q: no IPv4 address", host)
+}
+
 func parseRate(raw string) (int64, error) {
 	s := strings.TrimSpace(raw)
 	if s == "" {
@@ -370,6 +396,16 @@ func runTrace(args []string) {
 // successful test (Final received) or an error otherwise.
 func traceRun(ctx context.Context, cfg traceConfig) error {
 	startedAt := time.Now()
+
+	// Pin the target to a concrete IPv4 once, so the TCP control dial,
+	// the UDP stream resolve, and the ICMP probe all hit the same host.
+	// Generic DNS + dual-stack would otherwise let TCP land on IPv6 or
+	// a different A record than UDP/probe — a silent split-path bug.
+	pinned, err := resolveTargetIPv4(cfg.target)
+	if err != nil {
+		return fmt.Errorf("resolve target: %w", err)
+	}
+	cfg.target = pinned
 
 	cc, err := control.Dial(ctx, cfg.target)
 	if err != nil {
@@ -545,9 +581,12 @@ func traceRun(ctx context.Context, cfg traceConfig) error {
 			FlowID:    reverseFlowID,
 			Tick:      time.Second,
 			Snapshots: reverseSnaps,
-			// No kernel-drop sampler on the client side: the kernel-drop
-			// counter is process-wide and would conflate with any other
-			// UDP traffic on this host. Leaving it nil ⇒ nopSampler.
+			// No kernel-drop sampler on the client side. The server-side
+			// receiver already reports kernel_drops for the forward path
+			// (delta-baselined inside Receiver.Run); the client's reverse
+			// stream isn't the diagnostic surface a user expects to see
+			// kernel drops on, and leaving it nil keeps the reverse path
+			// from conflating host-wide UDP noise into the test report.
 		})
 		if err != nil {
 			return fmt.Errorf("init reverse receiver: %w", err)

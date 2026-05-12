@@ -28,3 +28,44 @@ func (nopSampler) Sample() (int64, error) { return 0, nil }
 func NewKernelDropSampler() KernelDropSampler {
 	return newPlatformSampler()
 }
+
+// baselineSampler wraps a KernelDropSampler and reports test-window
+// deltas instead of the underlying absolute counter. The platform
+// samplers read host-wide protocol counters (Linux /proc/net/snmp Udp
+// InErrors, Windows GetUdpStatisticsEx) — those include drops from
+// before the test started and from other UDP sockets on the host, so a
+// clean test would otherwise inherit unrelated noise.
+//
+// The first Sample() call latches the underlying value as the baseline
+// and returns 0; subsequent calls return current-baseline. If the
+// underlying counter ever moves backward (counter reset, wrap on a
+// long-lived host) the wrapper re-anchors to the new floor rather than
+// returning a bogus large negative-looking number.
+//
+// Not safe for concurrent use; the Receiver.Run loop is the only caller.
+type baselineSampler struct {
+	inner    KernelDropSampler
+	baseline int64
+	ready    bool
+}
+
+func newBaselineSampler(inner KernelDropSampler) *baselineSampler {
+	return &baselineSampler{inner: inner}
+}
+
+func (b *baselineSampler) Sample() (int64, error) {
+	n, err := b.inner.Sample()
+	if err != nil {
+		return 0, err
+	}
+	if !b.ready {
+		b.baseline = n
+		b.ready = true
+		return 0, nil
+	}
+	if n < b.baseline {
+		b.baseline = n
+		return 0, nil
+	}
+	return n - b.baseline, nil
+}
