@@ -152,6 +152,14 @@ type FinalStats struct {
 	Duplicates  int64        `json:"duplicates"`
 	JitterMS    float64      `json:"jitter_ms"`
 	KernelDrops int64        `json:"kernel_drops"`
+	// LocalDrops counts observations the receiver process dropped at its
+	// ring boundary (hub flow queue or direct-conn stat channel). NOT
+	// network loss: each dropped observation also creates a seq gap that
+	// the aggregator counts as Lost, so a non-zero LocalDrops means the
+	// reported Loss is inflated by however many local drops occurred and
+	// the verdict should be flagged suspect. Omitempty preserves wire
+	// compatibility with old servers that never set this field.
+	LocalDrops  int64        `json:"local_drops,omitempty"`
 	DurationS   float64      `json:"duration_s"`
 	Bursts      BurstBuckets `json:"bursts"`
 	RateTxBPS   int64        `json:"rate_tx_bps"`

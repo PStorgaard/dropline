@@ -73,6 +73,10 @@ type jsonStream struct {
 	Duplicates  int64      `json:"duplicates"`
 	JitterMS    float64    `json:"jitter_ms"`
 	KernelDrops int64      `json:"kernel_drops"`
+	// LocalDrops surfaces receiver ring-overflow drops. Omitempty so the
+	// JSON shape stays byte-identical to the v1 snapshot when zero (the
+	// common case); non-zero values flag the reported LossPct as suspect.
+	LocalDrops  int64      `json:"local_drops,omitempty"`
 	Bursts      jsonBursts `json:"bursts"`
 	RateTxBPS   int64      `json:"rate_tx_bps"`
 	RateRxBPS   int64      `json:"rate_rx_bps"`
@@ -130,6 +134,7 @@ func RenderJSON(w io.Writer, d Data) error {
 			Duplicates:  d.Stream.Duplicates,
 			JitterMS:    d.Stream.JitterMS,
 			KernelDrops: d.Stream.KernelDrops,
+			LocalDrops:  d.Stream.LocalDrops,
 			Bursts: jsonBursts{
 				One:    d.Stream.Bursts.One,
 				Two:    d.Stream.Bursts.Two,

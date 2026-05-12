@@ -256,6 +256,39 @@ func TestParseTraceArgsRateOverride(t *testing.T) {
 	}
 }
 
+// TestParseTraceArgsMTRIntervalBounds guards the floor and ceiling on
+// --mtr-interval. The floor keeps the forward prober's 16-bit ICMP seq
+// from wrapping inside the still-live lossTimeout window; the ceiling is
+// a usability gate. Values inside the range parse cleanly; values outside
+// must surface a "--mtr-interval must be in" error.
+func TestParseTraceArgsMTRIntervalBounds(t *testing.T) {
+	cases := []struct {
+		name   string
+		val    string
+		reject bool
+	}{
+		{"zero_rejected", "0", true},
+		{"below_floor", "50ms", true},
+		{"at_floor", "100ms", false},
+		{"default", "1s", false},
+		{"at_ceiling", "60s", false},
+		{"above_ceiling", "61s", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args := []string{"--mtr-interval", tc.val, "1.2.3.4"}
+			if tc.reject {
+				err := parseErr(t, args, true)
+				if !strings.Contains(err.Error(), "--mtr-interval") {
+					t.Errorf("--mtr-interval=%s: error=%q, want substring \"--mtr-interval\"", tc.val, err)
+				}
+			} else {
+				_ = parse(t, args, true)
+			}
+		})
+	}
+}
+
 func TestNormalizeTarget(t *testing.T) {
 	cases := []struct {
 		in   string

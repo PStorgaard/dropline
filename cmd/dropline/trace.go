@@ -36,6 +36,20 @@ import (
 // run both servers side-by-side without a port collision.
 const defaultPort = "5301"
 
+// MTR interval bounds. The floor keeps the forward prober's 16-bit ICMP
+// seq from wrapping inside the still-live lossTimeout window: at 100ms ×
+// MaxHops=30 = 300 probes/s, the 2s lossTimeout (internal/probe/probe.go)
+// holds at most ~600 inflight entries, three orders of magnitude below
+// 65536. Below the floor the receive loop and per-hop bookkeeping start
+// drifting (a wrap collision orphans a hop's inflight counter when the
+// late reply decrements the new owner's slot instead). Ceiling is a
+// usability gate: above 60s the sweep emits too rarely to be useful in
+// a typical session. validateHello on the server mirrors these in ms.
+const (
+	minMTRInterval = 100 * time.Millisecond
+	maxMTRInterval = 60 * time.Second
+)
+
 type outputMode int
 
 const (
@@ -179,8 +193,9 @@ func parseTraceArgs(args []string, stdoutIsTTY bool, errOut io.Writer) (traceCon
 	if *duration <= 0 {
 		return traceConfig{}, fmt.Errorf("--duration must be > 0, got %s", *duration)
 	}
-	if *mtrInterval <= 0 {
-		return traceConfig{}, fmt.Errorf("--mtr-interval must be > 0, got %s", *mtrInterval)
+	if *mtrInterval < minMTRInterval || *mtrInterval > maxMTRInterval {
+		return traceConfig{}, fmt.Errorf("--mtr-interval must be in [%s, %s], got %s",
+			minMTRInterval, maxMTRInterval, *mtrInterval)
 	}
 
 	return traceConfig{
@@ -990,6 +1005,7 @@ func reverseStreamReport(v *agg.StreamView, fs *control.FinalStats) *report.Reve
 		out.Duplicates = v.Duplicates
 		out.LossPct = v.LossPct
 		out.JitterMS = v.JitterMS
+		out.LocalDrops = v.LocalDrops
 	}
 	return &out
 }

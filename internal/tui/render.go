@@ -104,16 +104,16 @@ func renderKPI(opts Options, view agg.StreamView, elapsed time.Duration, paused 
 	// line 2: loss / jitter / counters / verdict
 	lossCell := lossColor(view.LossPct).Render(fmt.Sprintf("%.3f%%", view.LossPct))
 	verdict := okStyle.Render("✓ network loss is real")
-	if view.KernelDrops > 0 {
+	if view.KernelDrops > 0 || view.LocalDrops > 0 {
 		verdict = amberStyle.Render("⚠ network loss is suspect")
 	}
 	fmt.Fprintf(&sb, "udp loss  %s   jitter %.2f ms   recv %d   lost %d   %s\n",
 		lossCell, view.JitterMS, view.Recv, view.Lost, verdict)
 
-	// line 3: kernel drops + burst summary
+	// line 3: kernel/local drops + burst summary
 	b := view.Bursts
-	fmt.Fprintf(&sb, "kernel drops: %d   bursts: %s",
-		view.KernelDrops,
+	fmt.Fprintf(&sb, "kernel drops: %d   local drops: %d   bursts: %s",
+		view.KernelDrops, view.LocalDrops,
 		agg.FormatBurstSummary(b.Ten99, b.HundredUp, b.Max))
 
 	return renderSection(titleLeft, headerStyle, sb.String(), width)

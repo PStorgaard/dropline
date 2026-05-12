@@ -84,6 +84,11 @@ type ReverseStreamReport struct {
 	LossPct float64 `json:"loss_pct"`
 	// JitterMS is the RFC 3550 EWMA jitter the client observed.
 	JitterMS float64 `json:"jitter_ms"`
+	// LocalDrops is the count of reverse-stream observations the client
+	// dropped at its ring boundary. NOT network loss; same semantics as
+	// Data.Stream.LocalDrops for the forward direction. Omitempty so the
+	// JSON shape stays byte-identical to the v1 snapshot when zero.
+	LocalDrops int64 `json:"local_drops,omitempty"`
 	// DurationS is the wall-clock duration the server-side sender
 	// actually ran for.
 	DurationS float64 `json:"duration_s"`

@@ -116,6 +116,9 @@ func TestValidateHello(t *testing.T) {
 		{"duration_zero", func(h *control.Hello) { h.DurationMS = 0 }, "duration_ms"},
 		{"duration_over_cap", func(h *control.Hello) { h.DurationMS = maxSessionDurationMS + 1 }, "exceeds server cap"},
 		{"rate_zero", func(h *control.Hello) { h.RateBPS = 0 }, "rate_bps"},
+		{"mtr_below_floor", func(h *control.Hello) { h.MTRIntervalMS = minMTRIntervalMS - 1 }, "mtr_interval_ms"},
+		{"mtr_above_ceiling", func(h *control.Hello) { h.MTRIntervalMS = maxMTRIntervalMS + 1 }, "mtr_interval_ms"},
+		{"tcp_corroborate_negative", func(h *control.Hello) { h.TCPCorroborateRateBPS = -1 }, "tcp_corroborate_rate_bps"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -147,6 +150,77 @@ func TestValidateHelloRateCap(t *testing.T) {
 	reason := validateHello(&over, 100_000_000)
 	if !strings.Contains(reason, "exceeds server cap") {
 		t.Errorf("over-cap rate: reason=%q, want substring \"exceeds server cap\"", reason)
+	}
+
+	// TCPCorroborateRateBPS must obey the same per-session cap as RateBPS.
+	tcpOver := *good
+	tcpOver.TCPCorroborateRateBPS = 200_000_000
+	reason = validateHello(&tcpOver, 100_000_000)
+	if !strings.Contains(reason, "tcp_corroborate_rate_bps") || !strings.Contains(reason, "exceeds server cap") {
+		t.Errorf("tcp-corroborate over-cap: reason=%q, want substring \"tcp_corroborate_rate_bps … exceeds server cap\"", reason)
+	}
+	// Zero is "disabled" and must pass even with a tight cap.
+	zero := *good
+	zero.TCPCorroborateRateBPS = 0
+	if reason := validateHello(&zero, 100_000_000); reason != "" {
+		t.Errorf("tcp-corroborate zero (disabled) rejected with cap: %q", reason)
+	}
+}
+
+// TestValidateHelloMTRBounds covers the MTR-interval bounds. Zero is the
+// legacy "no field" signal and must pass; the floor and ceiling are
+// inclusive, anything outside is rejected.
+func TestValidateHelloMTRBounds(t *testing.T) {
+	base := &control.Hello{Type: control.TypeHello, Version: 1, Mode: "loss",
+		RateBPS: 1_000_000, DurationMS: 1000, PacketSize: 1200, FlowID: 1}
+
+	cases := []struct {
+		name   string
+		ms     int64
+		reject bool
+	}{
+		{"zero_legacy", 0, false},
+		{"below_floor", minMTRIntervalMS - 1, true},
+		{"at_floor", minMTRIntervalMS, false},
+		{"at_ceiling", maxMTRIntervalMS, false},
+		{"above_ceiling", maxMTRIntervalMS + 1, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := *base
+			h.MTRIntervalMS = tc.ms
+			reason := validateHello(&h, 0)
+			if tc.reject && reason == "" {
+				t.Errorf("MTRIntervalMS=%d: expected rejection, got pass", tc.ms)
+			}
+			if !tc.reject && reason != "" {
+				t.Errorf("MTRIntervalMS=%d: unexpected rejection: %q", tc.ms, reason)
+			}
+		})
+	}
+}
+
+// TestBuildFinalCopiesLocalDrops verifies the receiver's LocalDrops counter
+// reaches the wire. Receiver overload creates seq gaps that look like
+// network loss in the aggregator; LocalDrops on the wire is the only signal
+// the renderer has to mark the verdict suspect.
+func TestBuildFinalCopiesLocalDrops(t *testing.T) {
+	hello := &control.Hello{Type: control.TypeHello, Version: 1, Mode: "loss",
+		RateBPS: 1_000_000, DurationMS: 1000, PacketSize: 1200, FlowID: 1}
+	snap := stream.Snapshot{
+		Recv:        42,
+		Lost:        7,
+		LocalDrops:  3,
+		KernelDrops: 1,
+		T:           1.0,
+		MaxSeq:      48,
+	}
+	fs := buildFinal(hello, snap, nil, nil)
+	if fs.Stats.LocalDrops != 3 {
+		t.Errorf("LocalDrops not propagated: got %d, want 3", fs.Stats.LocalDrops)
+	}
+	if fs.Stats.KernelDrops != 1 {
+		t.Errorf("KernelDrops regression: got %d, want 1", fs.Stats.KernelDrops)
 	}
 }
 

@@ -558,6 +558,15 @@ func TestRenderKPIVerdict(t *testing.T) {
 	if !strings.Contains(suspect, "⚠ network loss is suspect") {
 		t.Errorf("expected suspect verdict; got\n%s", suspect)
 	}
+	// LocalDrops alone (KernelDrops==0) must also flip the verdict, since a
+	// non-zero count means receiver overload inflated the loss reading.
+	localSuspect := stripANSI(renderKPI(opts, agg.StreamView{LossPct: 0.5, LocalDrops: 7}, 5*time.Second, false, "[bar]", 120))
+	if !strings.Contains(localSuspect, "⚠ network loss is suspect") {
+		t.Errorf("expected suspect verdict from LocalDrops alone; got\n%s", localSuspect)
+	}
+	if !strings.Contains(localSuspect, "local drops: 7") {
+		t.Errorf("expected 'local drops: 7' in KPI body; got\n%s", localSuspect)
+	}
 }
 
 // renderKPI tags the elapsed line with [PAUSED] when paused=true so the

@@ -39,6 +39,10 @@ func RenderText(w io.Writer, d Data) error {
 	if d.Stream.KernelDrops > 0 {
 		kdNote = "  ! "
 	}
+	ldNote := ""
+	if d.Stream.LocalDrops > 0 {
+		ldNote = "  ! receiver overload — udp loss above is suspect"
+	}
 
 	sb.WriteString("\nudp stream:\n")
 	fmt.Fprintf(&sb, "  sent:         %d\n", d.Stream.Sent)
@@ -48,6 +52,7 @@ func RenderText(w io.Writer, d Data) error {
 	fmt.Fprintf(&sb, "  duplicates:   %d\n", d.Stream.Duplicates)
 	fmt.Fprintf(&sb, "  jitter:       %.2f ms\n", d.Stream.JitterMS)
 	fmt.Fprintf(&sb, "  kernel drops: %d%s\n", d.Stream.KernelDrops, kdNote)
+	fmt.Fprintf(&sb, "  local drops:  %d%s\n", d.Stream.LocalDrops, ldNote)
 	fmt.Fprintf(&sb, "  rate (rx):    %s\n", agg.FormatRate(d.Stream.RateRxBPS))
 
 	b := d.Stream.Bursts
@@ -83,6 +88,9 @@ func RenderText(w io.Writer, d Data) error {
 		fmt.Fprintf(&sb, "  out of order: %d\n", r.OutOfOrder)
 		fmt.Fprintf(&sb, "  duplicates:   %d\n", r.Duplicates)
 		fmt.Fprintf(&sb, "  jitter:       %.2f ms\n", r.JitterMS)
+		if r.LocalDrops > 0 {
+			fmt.Fprintf(&sb, "  local drops:  %d  ! receiver overload — reverse udp loss above is suspect\n", r.LocalDrops)
+		}
 		fmt.Fprintf(&sb, "  duration:     %.2fs\n", r.DurationS)
 	}
 

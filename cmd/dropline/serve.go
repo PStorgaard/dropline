@@ -36,6 +36,15 @@ type serveConfig struct {
 // hold a session slot; the default trace duration (60s) is 60× below.
 const maxSessionDurationMS int64 = 60 * 60 * 1000
 
+// MTR interval bounds enforced in validateHello. Mirror the client-side
+// time.Duration bounds in trace.go (minMTRInterval / maxMTRInterval).
+// MTRIntervalMS == 0 is the legacy pre-MTR-field signal from old clients
+// and is accepted as-is — reverseInterval() substitutes a 1s default.
+const (
+	minMTRIntervalMS int64 = 100
+	maxMTRIntervalMS int64 = 60_000
+)
+
 func parseServeArgs(args []string, errOut io.Writer) (serveConfig, error) {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	fs.SetOutput(errOut)
@@ -601,6 +610,7 @@ func buildFinal(hello *control.Hello, s stream.Snapshot,
 			Duplicates:  s.Duplicates,
 			JitterMS:    s.JitterMS,
 			KernelDrops: s.KernelDrops,
+			LocalDrops:  s.LocalDrops,
 			DurationS:   s.T,
 			Bursts: control.BurstBuckets{
 				One:       s.Bursts.One,
@@ -642,6 +652,24 @@ func validateHello(h *control.Hello, maxRateBPS int64) string {
 	}
 	if maxRateBPS > 0 && h.RateBPS > maxRateBPS {
 		return fmt.Sprintf("rate_bps %d exceeds server cap %d", h.RateBPS, maxRateBPS)
+	}
+	// MTRIntervalMS == 0 is the old-client signal for "no MTR field"; the
+	// server falls back to 1s in reverseInterval(). Reject any non-zero
+	// value outside the documented bounds so a malicious client can't
+	// drive the reverse prober at flood rates.
+	if h.MTRIntervalMS != 0 && (h.MTRIntervalMS < minMTRIntervalMS || h.MTRIntervalMS > maxMTRIntervalMS) {
+		return fmt.Sprintf("mtr_interval_ms %d out of range [%d,%d]",
+			h.MTRIntervalMS, minMTRIntervalMS, maxMTRIntervalMS)
+	}
+	// TCPCorroborateRateBPS == 0 means "TCP corroboration disabled" (the
+	// field is omitempty on the wire). When non-zero, apply the same
+	// per-session cap as the forward UDP rate.
+	if h.TCPCorroborateRateBPS < 0 {
+		return fmt.Sprintf("tcp_corroborate_rate_bps must be >= 0, got %d", h.TCPCorroborateRateBPS)
+	}
+	if maxRateBPS > 0 && h.TCPCorroborateRateBPS > maxRateBPS {
+		return fmt.Sprintf("tcp_corroborate_rate_bps %d exceeds server cap %d",
+			h.TCPCorroborateRateBPS, maxRateBPS)
 	}
 	return ""
 }
