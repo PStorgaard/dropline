@@ -34,9 +34,9 @@ func TestHubRoutesByFlowID(t *testing.T) {
 	)
 	rateBPS := int64(packetSize * 8 * pps)
 
-	flowAHandle := hub.Register(flowA, DefaultRingSize)
+	flowAHandle := hub.Register(flowA, DefaultRingSize, nil)
 	defer flowAHandle.Release()
-	flowBHandle := hub.Register(flowB, DefaultRingSize)
+	flowBHandle := hub.Register(flowB, DefaultRingSize, nil)
 	defer flowBHandle.Release()
 
 	dial := func() *net.UDPConn {
@@ -157,7 +157,7 @@ func TestHubRingOverflowAccountsLocalDrops(t *testing.T) {
 
 	const flow uint32 = 0xDEADBEEF
 	const ringSize = 1
-	flowHandle := hub.Register(flow, ringSize)
+	flowHandle := hub.Register(flow, ringSize, nil)
 	defer flowHandle.Release()
 
 	// Send 5 packets without draining the channel — the first will park in
@@ -210,7 +210,7 @@ func TestHubReleaseStopsDelivery(t *testing.T) {
 	go func() { _ = hub.Run(hubCtx) }()
 
 	const flow uint32 = 0xFEEDFACE
-	flowHandle := hub.Register(flow, DefaultRingSize)
+	flowHandle := hub.Register(flow, DefaultRingSize, nil)
 	flowHandle.Release()
 
 	// Channel must already be closed.
@@ -239,13 +239,13 @@ func TestHubTryRegisterCollision(t *testing.T) {
 
 	hub := NewHub(rconn)
 	const flow uint32 = 0x12345678
-	first, ok := hub.TryRegister(flow, DefaultRingSize)
+	first, ok := hub.TryRegister(flow, DefaultRingSize, nil)
 	if !ok || first == nil {
 		t.Fatalf("first TryRegister: got ok=%v handle=%v, want ok=true non-nil", ok, first)
 	}
 	defer first.Release()
 
-	dup, ok := hub.TryRegister(flow, DefaultRingSize)
+	dup, ok := hub.TryRegister(flow, DefaultRingSize, nil)
 	if ok || dup != nil {
 		t.Fatalf("dup TryRegister: got ok=%v handle=%v, want ok=false nil", ok, dup)
 	}
@@ -272,7 +272,7 @@ func TestHubDoubleRegisterPanics(t *testing.T) {
 
 	hub := NewHub(rconn)
 	const flow uint32 = 0xABCD1234
-	first := hub.Register(flow, DefaultRingSize)
+	first := hub.Register(flow, DefaultRingSize, nil)
 	defer first.Release()
 
 	defer func() {
@@ -280,7 +280,7 @@ func TestHubDoubleRegisterPanics(t *testing.T) {
 			t.Error("expected panic on duplicate Register, got nil")
 		}
 	}()
-	_ = hub.Register(flow, DefaultRingSize)
+	_ = hub.Register(flow, DefaultRingSize, nil)
 }
 
 // TestHubFlowRemoteAddrBlocksUntilFirstPacket asserts the contract the
@@ -302,7 +302,7 @@ func TestHubFlowRemoteAddrBlocksUntilFirstPacket(t *testing.T) {
 	go func() { _ = hub.Run(hubCtx) }()
 
 	const flow uint32 = 0xCAFEBABE
-	flowHandle := hub.Register(flow, DefaultRingSize)
+	flowHandle := hub.Register(flow, DefaultRingSize, nil)
 	defer flowHandle.Release()
 
 	// Pre-packet: a short-timeout RemoteAddr should fail with DeadlineExceeded.
@@ -406,7 +406,7 @@ func TestHubReleaseDuringActiveSend(t *testing.T) {
 	// Repeat the register/release cycle several times under load; each
 	// cycle is a fresh chance for the race to fire if the fix regresses.
 	for i := 0; i < 5; i++ {
-		flowHandle := hub.Register(flow, DefaultRingSize)
+		flowHandle := hub.Register(flow, DefaultRingSize, nil)
 
 		sconn, err := net.DialUDP("udp4", nil, addr)
 		if err != nil {
@@ -436,5 +436,144 @@ func TestHubReleaseDuringActiveSend(t *testing.T) {
 		// Drain the rest of the sender; we don't care about counts.
 		<-sendDone
 		_ = sconn.Close()
+	}
+}
+
+// TestHubDropsSpoofedSourcePacket registers a flow expecting peer
+// 127.0.0.2 and sends one valid packet from 127.0.0.1 (the only IP a
+// loopback test can actually send from). The drainer must drop it
+// silently so a spoofed first-packet attack can't latch the reverse
+// target onto an arbitrary IP.
+func TestHubDropsSpoofedSourcePacket(t *testing.T) {
+	rconn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP: %v", err)
+	}
+	defer func() { _ = rconn.Close() }()
+	addr := rconn.LocalAddr().(*net.UDPAddr)
+
+	hub := NewHub(rconn)
+	hubCtx, hubCancel := context.WithCancel(context.Background())
+	defer hubCancel()
+	go func() { _ = hub.Run(hubCtx) }()
+
+	const flow uint32 = 0x5A150001
+	flowHandle := hub.Register(flow, DefaultRingSize, net.IPv4(127, 0, 0, 2))
+	defer flowHandle.Release()
+
+	sconn, err := net.DialUDP("udp4", nil, addr)
+	if err != nil {
+		t.Fatalf("DialUDP: %v", err)
+	}
+	defer func() { _ = sconn.Close() }()
+	const packetSize = HeaderSize + 32
+	buf := make([]byte, packetSize)
+	EncodeHeader(buf, Header{Magic: Magic, FlowID: flow, Seq: 0, TxUnixNS: time.Now().UnixNano()})
+	if _, err := sconn.Write(buf); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	select {
+	case obs, ok := <-flowHandle.Observations():
+		if ok {
+			t.Errorf("spoofed-source packet was delivered: %#v", obs)
+		}
+	case <-time.After(200 * time.Millisecond):
+		// expected: packet dropped silently
+	}
+
+	// RemoteAddr must NOT resolve either — captureRemote is gated by the
+	// same source-IP check, so the reverse-direction Sender stays parked
+	// rather than latching onto the spoofed address.
+	rctx, rcancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer rcancel()
+	if got, err := flowHandle.RemoteAddr(rctx); err == nil {
+		t.Errorf("RemoteAddr resolved despite spoof: got %v", got)
+	}
+}
+
+// TestHubAcceptsMatchingSourcePacket is the positive regression: when
+// the source matches expectedPeerIP, the packet flows through normally.
+func TestHubAcceptsMatchingSourcePacket(t *testing.T) {
+	rconn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP: %v", err)
+	}
+	defer func() { _ = rconn.Close() }()
+	addr := rconn.LocalAddr().(*net.UDPAddr)
+
+	hub := NewHub(rconn)
+	hubCtx, hubCancel := context.WithCancel(context.Background())
+	defer hubCancel()
+	go func() { _ = hub.Run(hubCtx) }()
+
+	const flow uint32 = 0x5A150002
+	flowHandle := hub.Register(flow, DefaultRingSize, net.IPv4(127, 0, 0, 1))
+	defer flowHandle.Release()
+
+	sconn, err := net.DialUDP("udp4", nil, addr)
+	if err != nil {
+		t.Fatalf("DialUDP: %v", err)
+	}
+	defer func() { _ = sconn.Close() }()
+	const packetSize = HeaderSize + 32
+	buf := make([]byte, packetSize)
+	EncodeHeader(buf, Header{Magic: Magic, FlowID: flow, Seq: 0, TxUnixNS: time.Now().UnixNano()})
+	if _, err := sconn.Write(buf); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	select {
+	case obs, ok := <-flowHandle.Observations():
+		if !ok {
+			t.Fatal("channel closed before observation arrived")
+		}
+		if obs.h.FlowID != flow {
+			t.Errorf("wrong flow id: got %x want %x", obs.h.FlowID, flow)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("matching-source packet did not arrive within 1s")
+	}
+}
+
+// TestHubNilExpectedPeerIPAcceptsAny pins the back-compat ergonomics
+// the rest of the test suite relies on — nil expectedPeerIP means
+// "accept any source".
+func TestHubNilExpectedPeerIPAcceptsAny(t *testing.T) {
+	rconn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP: %v", err)
+	}
+	defer func() { _ = rconn.Close() }()
+	addr := rconn.LocalAddr().(*net.UDPAddr)
+
+	hub := NewHub(rconn)
+	hubCtx, hubCancel := context.WithCancel(context.Background())
+	defer hubCancel()
+	go func() { _ = hub.Run(hubCtx) }()
+
+	const flow uint32 = 0x5A150003
+	flowHandle := hub.Register(flow, DefaultRingSize, nil)
+	defer flowHandle.Release()
+
+	sconn, err := net.DialUDP("udp4", nil, addr)
+	if err != nil {
+		t.Fatalf("DialUDP: %v", err)
+	}
+	defer func() { _ = sconn.Close() }()
+	const packetSize = HeaderSize + 32
+	buf := make([]byte, packetSize)
+	EncodeHeader(buf, Header{Magic: Magic, FlowID: flow, Seq: 0, TxUnixNS: time.Now().UnixNano()})
+	if _, err := sconn.Write(buf); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	select {
+	case _, ok := <-flowHandle.Observations():
+		if !ok {
+			t.Fatal("channel closed before observation arrived")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("packet did not arrive with nil expectedPeerIP")
 	}
 }

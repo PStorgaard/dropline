@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -24,8 +25,10 @@ import (
 )
 
 type serveConfig struct {
-	listen      string
-	maxSessions int
+	listen             string
+	maxSessions        int
+	maxRateBPS         int64 // 0 == unlimited
+	allowReverseStream bool
 }
 
 // maxSessionDurationMS caps Hello.DurationMS at admission time. The cap
@@ -38,6 +41,8 @@ func parseServeArgs(args []string, errOut io.Writer) (serveConfig, error) {
 	fs.SetOutput(errOut)
 	listen := fs.String("listen", ":5301", "address to bind for both TCP control and UDP stream")
 	maxSessions := fs.Int("max-sessions", 4, "maximum concurrent client sessions")
+	maxRateRaw := fs.String("max-rate-bps", "1G", "per-session send-rate cap (bps; suffixes K/M/G accepted; 0 or \"unlimited\" disables the cap)")
+	allowReverseStream := fs.Bool("allow-reverse-stream", true, "permit server-side reverse-direction UDP loss test")
 	if err := fs.Parse(args); err != nil {
 		return serveConfig{}, err
 	}
@@ -50,10 +55,28 @@ func parseServeArgs(args []string, errOut io.Writer) (serveConfig, error) {
 	if *maxSessions < 1 {
 		return serveConfig{}, fmt.Errorf("--max-sessions must be >= 1, got %d", *maxSessions)
 	}
+	maxRateBPS, err := parseMaxRate(*maxRateRaw)
+	if err != nil {
+		return serveConfig{}, fmt.Errorf("--max-rate-bps: %w", err)
+	}
 	return serveConfig{
-		listen:      *listen,
-		maxSessions: *maxSessions,
+		listen:             *listen,
+		maxSessions:        *maxSessions,
+		maxRateBPS:         maxRateBPS,
+		allowReverseStream: *allowReverseStream,
 	}, nil
+}
+
+// parseMaxRate is a thin wrapper over parseRate that accepts "0" and
+// "unlimited" as "no cap". parseRate itself rejects zero because
+// --rate / --tcp-corroborate-rate legitimately require non-zero send
+// rates; loosening it there would silently break those.
+func parseMaxRate(raw string) (int64, error) {
+	s := strings.TrimSpace(raw)
+	if s == "0" || strings.EqualFold(s, "unlimited") {
+		return 0, nil
+	}
+	return parseRate(raw)
 }
 
 func runServe(args []string) {
@@ -106,7 +129,12 @@ func serveRun(ctx context.Context, cfg serveConfig) error {
 	// /proc-read failures (see internal/stream/rmemmax_*).
 	stream.WarnIfRmemMaxBelow(os.Stderr, stream.DefaultSocketBuf)
 
-	fmt.Fprintf(os.Stderr, "dropline serve: listening on %s (TCP control + UDP stream, max-sessions=%d)\n", cfg.listen, cfg.maxSessions)
+	rateBanner := "unlimited"
+	if cfg.maxRateBPS > 0 {
+		rateBanner = fmt.Sprintf("%d bps", cfg.maxRateBPS)
+	}
+	fmt.Fprintf(os.Stderr, "dropline serve: listening on %s (TCP control + UDP stream, max-sessions=%d, max-rate-bps=%s, allow-reverse-stream=%t)\n",
+		cfg.listen, cfg.maxSessions, rateBanner, cfg.allowReverseStream)
 
 	// One Hub demultiplexes UDP packets by flow_id across all concurrent
 	// sessions. Its Run goroutine is the single ReadFromUDP caller for
@@ -121,7 +149,7 @@ func serveRun(ctx context.Context, cfg serveConfig) error {
 
 	reg := newSessionRegistry()
 	srv := &control.Server{
-		Handler:      newServeHandler(hub, rawICMP.OK, cfg.maxSessions, reg),
+		Handler:      newServeHandler(hub, rawICMP.OK, cfg.maxSessions, cfg.maxRateBPS, cfg.allowReverseStream, reg),
 		ProbeHandler: newProbeHandler(reg, cfg.maxSessions),
 	}
 	err = srv.Serve(ctx, tcpLn)
@@ -132,10 +160,12 @@ func serveRun(ctx context.Context, cfg serveConfig) error {
 // newServeHandler returns a control.Handler that admits up to
 // maxSessions concurrent sessions and rejects further attempts with
 // "server busy". reverseCapable threads server-side raw-ICMP capability
-// into each session's reverse-trace decision. The registry threads
-// session liveness to newProbeHandler so tcp_probe connections can be
-// gated by an active session.
-func newServeHandler(hub *stream.Hub, reverseCapable bool, maxSessions int, reg *sessionRegistry) control.Handler {
+// into each session's reverse-trace decision. maxRateBPS caps the
+// client-requested send rate (0 = unlimited); allowReverseStream is the
+// global kill switch for the reverse-direction UDP loss test. The
+// registry threads session liveness to newProbeHandler so tcp_probe
+// connections can be gated by an active session.
+func newServeHandler(hub *stream.Hub, reverseCapable bool, maxSessions int, maxRateBPS int64, allowReverseStream bool, reg *sessionRegistry) control.Handler {
 	if maxSessions < 1 {
 		maxSessions = 1
 	}
@@ -147,7 +177,7 @@ func newServeHandler(hub *stream.Hub, reverseCapable bool, maxSessions int, reg 
 		default:
 			return c.Send(&control.Error{Type: control.TypeError, Reason: "server busy: max sessions reached"})
 		}
-		return handleSession(ctx, c, hello, hub, reverseCapable, reg)
+		return handleSession(ctx, c, hello, hub, reverseCapable, maxRateBPS, allowReverseStream, reg)
 	}
 }
 
@@ -183,8 +213,8 @@ func (r *sessionRegistry) has(sid string) bool {
 	return ok
 }
 
-func handleSession(ctx context.Context, c *control.Conn, hello *control.Hello, hub *stream.Hub, reverseCapable bool, reg *sessionRegistry) error {
-	if reason := validateHello(hello); reason != "" {
+func handleSession(ctx context.Context, c *control.Conn, hello *control.Hello, hub *stream.Hub, reverseCapable bool, maxRateBPS int64, allowReverseStream bool, reg *sessionRegistry) error {
+	if reason := validateHello(hello, maxRateBPS); reason != "" {
 		return c.Send(&control.Error{Type: control.TypeError, Reason: reason})
 	}
 	sid, err := mintSessionID()
@@ -196,15 +226,30 @@ func handleSession(ctx context.Context, c *control.Conn, hello *control.Hello, h
 	reg.add(sid)
 	defer reg.remove(sid)
 
+	// Pin the TCP control peer's IPv4 address up front; the hub uses it
+	// to drop spoofed-source UDP, and the reverse-trace prober uses it
+	// as the TTL-walk target. nil means non-TCPv4 (IPv6 client, etc.),
+	// in which case both reverse paths are forced off — reverse stream
+	// can't work without a known peer IP, and reverse trace was already
+	// gated this way.
+	clientIP := clientIPv4(c.RemoteAddr())
+
 	reverseDecision := resolveReverseTrace(hello.ReverseTrace, reverseCapable)
 	reverseStreamDecision, reverseStreamFlowID := resolveReverseStream(hello.ReverseStream, hello.ReverseFlowID, hello.FlowID)
 	tcpCorroborateDecision := resolveTCPCorroborate(hello.TCPCorroborate)
+	if clientIP == nil {
+		reverseDecision = "off"
+		reverseStreamDecision, reverseStreamFlowID = "off", 0
+	}
+	if !allowReverseStream {
+		reverseStreamDecision, reverseStreamFlowID = "off", 0
+	}
 
 	// Register the flow_id BEFORE sending Ready so a collision produces a
 	// terminal Error rather than a Ready-then-Error sequence. The Hub's
 	// panicking Register is reserved for invariants the server controls;
 	// flow_id comes from an untrusted Hello, so use TryRegister.
-	flowHandle, ok := hub.TryRegister(hello.FlowID, stream.DefaultRingSize)
+	flowHandle, ok := hub.TryRegister(hello.FlowID, stream.DefaultRingSize, clientIP)
 	if !ok {
 		return c.Send(&control.Error{Type: control.TypeError, Reason: "flow_id collision; retry with a fresh flow_id"})
 	}
@@ -298,12 +343,9 @@ func handleSession(ctx context.Context, c *control.Conn, hello *control.Hello, h
 	// log and downgrade silently — the client already saw "on" in Ready.
 	var reverseWG sync.WaitGroup
 	if reverseDecision == "on" {
-		clientIP := clientIPv4(c.RemoteAddr())
-		if clientIP == nil {
-			fmt.Fprintln(os.Stderr, "dropline serve: reverse trace skipped (no IPv4 RemoteAddr)")
-		} else {
-			startReverseTrace(sessionCtx, &reverseWG, c, clientIP, reverseInterval(hello.MTRIntervalMS))
-		}
+		// clientIP was already extracted up top; if it were nil
+		// reverseDecision would have been forced to "off".
+		startReverseTrace(sessionCtx, &reverseWG, c, clientIP, reverseInterval(hello.MTRIntervalMS))
 	}
 
 	// Reverse UDP stream: when the resolved decision is "on", run a
@@ -578,8 +620,8 @@ func buildFinal(hello *control.Hello, s stream.Snapshot,
 
 // validateHello returns an empty string if the Hello is acceptable, or a
 // human-readable reason for rejection. The reason is sent verbatim in the
-// Error message back to the client.
-func validateHello(h *control.Hello) string {
+// Error message back to the client. maxRateBPS=0 disables the rate cap.
+func validateHello(h *control.Hello, maxRateBPS int64) string {
 	if h.Version != 1 {
 		return fmt.Sprintf("unsupported version %d (server speaks v1)", h.Version)
 	}
@@ -597,6 +639,9 @@ func validateHello(h *control.Hello) string {
 	}
 	if h.RateBPS <= 0 {
 		return fmt.Sprintf("rate_bps must be > 0, got %d", h.RateBPS)
+	}
+	if maxRateBPS > 0 && h.RateBPS > maxRateBPS {
+		return fmt.Sprintf("rate_bps %d exceeds server cap %d", h.RateBPS, maxRateBPS)
 	}
 	return ""
 }

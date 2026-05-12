@@ -37,6 +37,44 @@ func TestParseServeArgsDefaults(t *testing.T) {
 	if cfg.listen != ":5301" {
 		t.Errorf("listen = %q, want :5301", cfg.listen)
 	}
+	if cfg.maxRateBPS != 1_000_000_000 {
+		t.Errorf("maxRateBPS = %d, want 1_000_000_000 (1G default)", cfg.maxRateBPS)
+	}
+	if !cfg.allowReverseStream {
+		t.Errorf("allowReverseStream = false, want true (default)")
+	}
+}
+
+func TestParseServeArgsMaxRateBPS(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want int64
+	}{
+		{"50M", 50_000_000},
+		{"1G", 1_000_000_000},
+		{"0", 0},
+		{"unlimited", 0},
+		{"UNLIMITED", 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.raw, func(t *testing.T) {
+			cfg := parseServe(t, []string{"--max-rate-bps", tc.raw})
+			if cfg.maxRateBPS != tc.want {
+				t.Errorf("maxRateBPS = %d, want %d", cfg.maxRateBPS, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseServeArgsAllowReverseStream(t *testing.T) {
+	cfg := parseServe(t, []string{"--allow-reverse-stream=false"})
+	if cfg.allowReverseStream {
+		t.Errorf("--allow-reverse-stream=false: got true, want false")
+	}
+	cfg = parseServe(t, []string{"--allow-reverse-stream=true"})
+	if !cfg.allowReverseStream {
+		t.Errorf("--allow-reverse-stream=true: got false, want true")
+	}
 }
 
 func TestParseServeArgsListenOverride(t *testing.T) {
@@ -63,7 +101,7 @@ func TestParseServeArgsErrors(t *testing.T) {
 func TestValidateHello(t *testing.T) {
 	good := &control.Hello{Type: control.TypeHello, Version: 1, Mode: "loss",
 		RateBPS: 1_000_000, DurationMS: 1000, PacketSize: 1200, FlowID: 1}
-	if reason := validateHello(good); reason != "" {
+	if reason := validateHello(good, 0); reason != "" {
 		t.Fatalf("good hello rejected: %s", reason)
 	}
 	cases := []struct {
@@ -83,11 +121,32 @@ func TestValidateHello(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			h := *good
 			tc.mutate(&h)
-			reason := validateHello(&h)
+			reason := validateHello(&h, 0)
 			if !strings.Contains(reason, tc.want) {
 				t.Errorf("reason=%q, want substring %q", reason, tc.want)
 			}
 		})
+	}
+}
+
+// TestValidateHelloRateCap covers the server-side --max-rate-bps gate.
+// maxRateBPS=0 must accept any positive rate (cap disabled); a positive
+// cap rejects rates above it with the documented error substring.
+func TestValidateHelloRateCap(t *testing.T) {
+	good := &control.Hello{Type: control.TypeHello, Version: 1, Mode: "loss",
+		RateBPS: 10_000_000, DurationMS: 1000, PacketSize: 1200, FlowID: 1}
+
+	if reason := validateHello(good, 0); reason != "" {
+		t.Errorf("cap=0 should disable the limit; got %q", reason)
+	}
+	if reason := validateHello(good, 100_000_000); reason != "" {
+		t.Errorf("rate under cap rejected: %q", reason)
+	}
+	over := *good
+	over.RateBPS = 200_000_000
+	reason := validateHello(&over, 100_000_000)
+	if !strings.Contains(reason, "exceeds server cap") {
+		t.Errorf("over-cap rate: reason=%q, want substring \"exceeds server cap\"", reason)
 	}
 }
 
@@ -114,7 +173,15 @@ func TestMintSessionIDIsHex(t *testing.T) {
 // startServer wires up a server on loopback and returns the bound TCP
 // address, the bound UDP address, and a teardown func. maxSessions of 0
 // uses the default of 4. The server keeps running until ctx is canceled.
+// maxRateBPS defaults to 0 (unlimited) and reverse stream is allowed.
 func startServer(t *testing.T, ctx context.Context, maxSessions int) (tcpAddr string, udpAddr *net.UDPAddr, teardown func()) {
+	t.Helper()
+	return startServerWith(t, ctx, maxSessions, 0, true)
+}
+
+// startServerWith is the configurable form used by tests that exercise
+// --max-rate-bps and --allow-reverse-stream.
+func startServerWith(t *testing.T, ctx context.Context, maxSessions int, maxRateBPS int64, allowReverseStream bool) (tcpAddr string, udpAddr *net.UDPAddr, teardown func()) {
 	t.Helper()
 	if maxSessions == 0 {
 		maxSessions = 4
@@ -139,7 +206,7 @@ func startServer(t *testing.T, ctx context.Context, maxSessions int) (tcpAddr st
 	// that the test environment can't grant.
 	reg := newSessionRegistry()
 	srv := &control.Server{
-		Handler:      newServeHandler(hub, false, maxSessions, reg),
+		Handler:      newServeHandler(hub, false, maxSessions, maxRateBPS, allowReverseStream, reg),
 		ProbeHandler: newProbeHandler(reg, maxSessions),
 	}
 	go func() { _ = srv.Serve(ctx, tcpLn) }()
@@ -618,7 +685,7 @@ func TestValidateHelloDoesNotPanicOnEmpty(t *testing.T) {
 			t.Fatalf("panic: %v", r)
 		}
 	}()
-	if reason := validateHello(&control.Hello{}); reason == "" {
+	if reason := validateHello(&control.Hello{}, 0); reason == "" {
 		t.Fatal("empty hello accepted; expected rejection")
 	}
 }
@@ -783,6 +850,120 @@ func TestServeStatsForwarderBailsOnSendError(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed >= time.Duration(sessionDurationMS)*time.Millisecond {
 		t.Errorf("session did not clean up promptly after peer closed: elapsed=%s, DurationMS=%dms", elapsed, sessionDurationMS)
+	}
+}
+
+// TestServeRejectsRateOverCap drives the --max-rate-bps gate end-to-end:
+// a client whose Hello.RateBPS exceeds the server's cap must receive an
+// Error frame with the documented substring.
+func TestServeRejectsRateOverCap(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tcpAddr, _, teardown := startServerWith(t, ctx, 0, 1_000_000, true)
+	defer teardown()
+
+	c, err := control.Dial(ctx, tcpAddr)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	if err := c.Send(&control.Hello{
+		Type: control.TypeHello, Version: 1, Mode: "loss",
+		RateBPS: 10_000_000, DurationMS: 1000, PacketSize: 64, FlowID: 1,
+	}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if err := c.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("SetDeadline: %v", err)
+	}
+	msg, err := c.Recv()
+	if err != nil {
+		t.Fatalf("Recv: %v", err)
+	}
+	e, ok := msg.(*control.Error)
+	if !ok {
+		t.Fatalf("expected Error, got %#v", msg)
+	}
+	if !strings.Contains(e.Reason, "exceeds server cap") {
+		t.Errorf("reason=%q, want substring \"exceeds server cap\"", e.Reason)
+	}
+}
+
+// TestServeReverseStreamDisabledByFlag covers the --allow-reverse-stream
+// kill switch: a server started with allowReverseStream=false must
+// resolve every client's reverse stream to "off" regardless of what the
+// client asks for, and the resulting Final must carry ReverseSent=0.
+func TestServeReverseStreamDisabledByFlag(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tcpAddr, udpAddr, teardown := startServerWith(t, ctx, 0, 0, false)
+	defer teardown()
+
+	c, err := control.Dial(ctx, tcpAddr)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	const flowID uint32 = 0x7E5700A1
+	const reverseFlowID uint32 = 0x7E5700A2
+	const packetSize = 64
+	hello := &control.Hello{
+		Type: control.TypeHello, Version: 1, Mode: "loss",
+		RateBPS:       int64(packetSize) * 8 * 100,
+		DurationMS:    300,
+		PacketSize:    packetSize,
+		FlowID:        flowID,
+		ReverseStream: "on",
+		ReverseFlowID: reverseFlowID,
+	}
+	if err := c.Send(hello); err != nil {
+		t.Fatalf("Send hello: %v", err)
+	}
+	msg, err := c.Recv()
+	if err != nil {
+		t.Fatalf("Recv ready: %v", err)
+	}
+	ready, ok := msg.(*control.Ready)
+	if !ok {
+		t.Fatalf("expected Ready, got %#v", msg)
+	}
+	if ready.ReverseStream != "off" {
+		t.Errorf("Ready.ReverseStream = %q, want \"off\"", ready.ReverseStream)
+	}
+	if ready.ReverseFlowID != 0 {
+		t.Errorf("Ready.ReverseFlowID = %d, want 0", ready.ReverseFlowID)
+	}
+
+	// Drive a couple of forward packets so the session runs naturally.
+	sender, err := net.DialUDP("udp4", nil, udpAddr)
+	if err != nil {
+		t.Fatalf("DialUDP: %v", err)
+	}
+	defer func() { _ = sender.Close() }()
+	buf := make([]byte, packetSize)
+	for i := uint64(0); i < 3; i++ {
+		stream.EncodeHeader(buf, stream.Header{Magic: stream.Magic, FlowID: flowID, Seq: i, TxUnixNS: time.Now().UnixNano()})
+		if _, err := sender.Write(buf); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+
+	if err := c.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatalf("SetDeadline: %v", err)
+	}
+	for {
+		m, err := c.Recv()
+		if err != nil {
+			t.Fatalf("Recv: %v", err)
+		}
+		if f, ok := m.(*control.Final); ok {
+			if f.Stats.ReverseSent != 0 {
+				t.Errorf("Final.ReverseSent = %d, want 0 (reverse stream disabled)", f.Stats.ReverseSent)
+			}
+			return
+		}
 	}
 }
 

@@ -35,12 +35,19 @@ type Hub struct {
 // reverse-direction Sender (which shares the listening socket) learns
 // where to send replies. remoteOnce guarantees the channel is closed at
 // most once even if many goroutines race to capture the first packet.
+//
+// expectedPeerIP is the UDP source address the hub will accept for this
+// flow. nil means "accept any" (test-helper ergonomics). When non-nil
+// the drainer drops any packet whose source IP doesn't match — this is
+// what prevents a spoofed UDP packet from steering the reverse-direction
+// Sender at an arbitrary victim.
 type flowQueue struct {
-	ch         chan observation
-	localDrops atomic.Int64
-	remote     atomic.Pointer[net.UDPAddr]
-	remoteOnce sync.Once
-	remoteCh   chan struct{}
+	ch              chan observation
+	localDrops      atomic.Int64
+	remote          atomic.Pointer[net.UDPAddr]
+	remoteOnce      sync.Once
+	remoteCh        chan struct{}
+	expectedPeerIP  net.IP
 }
 
 // captureRemote records addr as this flow's first-observed peer the
@@ -125,14 +132,19 @@ func (h *Hub) Run(ctx context.Context) error {
 		// bounded by one channel-op + one atomic.
 		h.mu.RLock()
 		if fq, ok := h.flows[hdr.FlowID]; ok {
-			// Stamp the flow's first-observed peer addr exactly once.
-			// captureRemote is safe under RLock (it does an atomic
-			// store + sync.Once.Do; no map access).
-			fq.captureRemote(addr)
-			select {
-			case fq.ch <- observation{h: hdr, arrival: time.Now()}:
-			default:
-				fq.localDrops.Add(1)
+			// Drop packets whose UDP source doesn't match the flow's
+			// expected peer IP (nil = accept any, for test ergonomics).
+			// Silent drop: matches the existing "decode failure" style
+			// upstream and keeps the hot path branchless on the steady
+			// state. Must happen before captureRemote so a spoofed
+			// first packet can't latch the wrong reverse target.
+			if fq.expectedPeerIP == nil || addr.IP.Equal(fq.expectedPeerIP) {
+				fq.captureRemote(addr)
+				select {
+				case fq.ch <- observation{h: hdr, arrival: time.Now()}:
+				default:
+					fq.localDrops.Add(1)
+				}
 			}
 		}
 		h.mu.RUnlock()
@@ -142,14 +154,15 @@ func (h *Hub) Run(ctx context.Context) error {
 // Register reserves flow_id on the hub and returns a HubFlow handle. The
 // caller MUST Release the handle when the session ends; releasing closes
 // the per-flow channel and de-registers from the hub. ringSize=0 falls
-// back to DefaultRingSize.
+// back to DefaultRingSize. expectedPeerIP gates which UDP source the hub
+// will accept for this flow; pass nil to accept any (test helpers only).
 //
 // Panics if flow_id is already registered — the server-side serialization
 // (the control accept path) is responsible for never letting that happen.
 // Callers that handle untrusted flow_ids (e.g. straight from a client
 // Hello) should use TryRegister instead.
-func (h *Hub) Register(flowID uint32, ringSize int) *HubFlow {
-	hf, ok := h.TryRegister(flowID, ringSize)
+func (h *Hub) Register(flowID uint32, ringSize int, expectedPeerIP net.IP) *HubFlow {
+	hf, ok := h.TryRegister(flowID, ringSize, expectedPeerIP)
 	if !ok {
 		panic("stream: hub flow_id already registered")
 	}
@@ -161,13 +174,25 @@ func (h *Hub) Register(flowID uint32, ringSize int) *HubFlow {
 // registration untouched. Used by the server's control path, where the
 // flow_id arrives from an untrusted Hello and a collision must surface
 // as a clean Error frame rather than a goroutine panic.
-func (h *Hub) TryRegister(flowID uint32, ringSize int) (*HubFlow, bool) {
+func (h *Hub) TryRegister(flowID uint32, ringSize int, expectedPeerIP net.IP) (*HubFlow, bool) {
 	if ringSize <= 0 {
 		ringSize = DefaultRingSize
 	}
+	// Canonicalize to 4-byte form when the input is an IPv4 address so
+	// addr.IP.Equal in the drainer compares like-with-like; net.IP.Equal
+	// itself handles the v4-in-v6 form but we avoid the mismatch entirely.
+	var canonical net.IP
+	if expectedPeerIP != nil {
+		if v4 := expectedPeerIP.To4(); v4 != nil {
+			canonical = v4
+		} else {
+			canonical = expectedPeerIP
+		}
+	}
 	fq := &flowQueue{
-		ch:       make(chan observation, ringSize),
-		remoteCh: make(chan struct{}),
+		ch:             make(chan observation, ringSize),
+		remoteCh:       make(chan struct{}),
+		expectedPeerIP: canonical,
 	}
 
 	h.mu.Lock()
