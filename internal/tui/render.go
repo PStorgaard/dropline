@@ -31,17 +31,12 @@ var sparkStack = [8][3]rune{
 }
 
 var (
-	okStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
-	amberStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
-	redStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
-	dimStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	headerStyle  = lipgloss.NewStyle().Bold(true)
-	borderFG     = lipgloss.Color("8")
-	sectionInner = lipgloss.NewStyle().
-			BorderStyle(lipgloss.RoundedBorder()).
-			BorderTop(false).
-			BorderForeground(borderFG).
-			Padding(0, 1)
+	okStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
+	amberStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
+	redStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+	dimStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	headerStyle      = lipgloss.NewStyle().Bold(true)
+	barFilledStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("12"))
 	tableCellStyle   = lipgloss.NewStyle().PaddingRight(2)
 	tableHeaderStyle = tableCellStyle.Inherit(headerStyle)
 )
@@ -59,36 +54,73 @@ func lossColor(pct float64) lipgloss.Style {
 	}
 }
 
-// renderSection wraps body in a rounded box with title embedded in the
-// top border. titleStyle is applied to the title text only (the box
-// chrome stays dim). Manual top-line composition because lipgloss
-// borders don't natively support in-border titles.
-func renderSection(title string, titleStyle lipgloss.Style, body string, width int) string {
+// renderRule wraps body with a single dim horizontal rule that carries
+// the section title (`── title ──…─`). No bottom border, no left/right
+// chrome — visual grouping comes from the rule + a 2-space body indent
+// the caller is responsible for applying. titleStyle styles the title
+// text only; the rule itself stays dim.
+func renderRule(title string, titleStyle lipgloss.Style, body string, width int) string {
 	if width < 10 {
 		return body
 	}
-	inner := sectionInner.Width(width).Render(body)
-
-	corner := dimStyle.Render("╭")
-	endCorner := dimStyle.Render("╮")
 	dash := dimStyle.Render("─")
-
 	prefix := dash + dash + " "
 	suffix := " "
 	styledTitle := titleStyle.Render(title)
 	titleWidth := lipgloss.Width(prefix) + lipgloss.Width(styledTitle) + lipgloss.Width(suffix)
-	fill := width - 2 - titleWidth
+	fill := width - titleWidth
 	if fill < 0 {
 		fill = 0
 	}
-	top := corner + prefix + styledTitle + suffix + dimStyle.Render(strings.Repeat("─", fill)) + endCorner
-	return top + "\n" + inner
+	rule := prefix + styledTitle + suffix + dimStyle.Render(strings.Repeat("─", fill))
+	return rule + "\n" + body
+}
+
+// indentBlock prepends n spaces to each non-empty line of s. ANSI
+// escape sequences never contain '\n' so splitting on newline is safe
+// even when cells carry color codes.
+func indentBlock(s string, n int) string {
+	if n <= 0 || s == "" {
+		return s
+	}
+	indent := strings.Repeat(" ", n)
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		if line == "" {
+			continue
+		}
+		lines[i] = indent + line
+	}
+	return strings.Join(lines, "\n")
+}
+
+// renderBar produces a thin progress bar of the given visible width,
+// filled to pct ∈ [0,1]. Replaces bubbles/v2/progress so we get a
+// single-row "━" glyph instead of the half-block "▌" the lib renders.
+// The empty remainder is a dim "─" so the bar's track stays visible at
+// zero progress.
+func renderBar(pct float64, width int) string {
+	if width < 1 {
+		return ""
+	}
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 1 {
+		pct = 1
+	}
+	fill := int(pct * float64(width))
+	if fill > width {
+		fill = width
+	}
+	return barFilledStyle.Render(strings.Repeat("━", fill)) +
+		dimStyle.Render(strings.Repeat("─", width-fill))
 }
 
 // renderKPI is the top dashboard card: target/rate title, an
-// elapsed-vs-duration progress bar, the loss/jitter/verdict line, and a
-// stream-counters strip. Progress bar is rendered statically via
-// progress.Model.ViewAs — no animation goroutine.
+// elapsed-vs-duration progress bar, the loss/jitter line, the kernel/
+// local drops + bursts strip, and a right-aligned verdict on its own
+// line so it doesn't compete with the loss% for visual weight.
 func renderKPI(opts Options, view agg.StreamView, elapsed time.Duration, paused bool, bar string, width int) string {
 	var sb strings.Builder
 	titleLeft := fmt.Sprintf("dropline · %s · %s", opts.Target, agg.FormatRate(opts.RateBPS))
@@ -98,25 +130,38 @@ func renderKPI(opts Options, view agg.StreamView, elapsed time.Duration, paused 
 	if paused {
 		pausedTag = redStyle.Render("[PAUSED]") + "  "
 	}
-	fmt.Fprintf(&sb, "%selapsed %s  %s  duration %s\n",
+	fmt.Fprintf(&sb, "  %selapsed %s  %s  duration %s\n",
 		pausedTag, formatDuration(elapsed), bar, formatDuration(opts.Duration))
 
-	// line 2: loss / jitter / counters / verdict
+	// line 2: udp loss / jitter / counters
 	lossCell := lossColor(view.LossPct).Render(fmt.Sprintf("%.3f%%", view.LossPct))
+	fmt.Fprintf(&sb, "  udp loss  %s   jitter %.2f ms   recv %d   lost %d\n",
+		lossCell, view.JitterMS, view.Recv, view.Lost)
+
+	// line 3: kernel/local drops + burst summary
+	b := view.Bursts
+	fmt.Fprintf(&sb, "  kernel drops %d   local drops %d   bursts %s",
+		view.KernelDrops, view.LocalDrops,
+		agg.FormatBurstSummary(b.Ten99, b.HundredUp, b.Max))
+
+	// line 4: right-aligned verdict (its own line so it doesn't crowd
+	// the metrics row). Width-fallback: if the verdict alone wouldn't
+	// fit with at least 4 columns of padding ahead of it, emit it on a
+	// fresh left-indented line instead.
 	verdict := okStyle.Render("✓ network loss is real")
 	if view.KernelDrops > 0 || view.LocalDrops > 0 {
 		verdict = amberStyle.Render("⚠ network loss is suspect")
 	}
-	fmt.Fprintf(&sb, "udp loss  %s   jitter %.2f ms   recv %d   lost %d   %s\n",
-		lossCell, view.JitterMS, view.Recv, view.Lost, verdict)
+	verdictW := lipgloss.Width(verdict)
+	sb.WriteByte('\n')
+	if width >= verdictW+4 {
+		sb.WriteString(lipgloss.PlaceHorizontal(width, lipgloss.Right, verdict))
+	} else {
+		sb.WriteString("  ")
+		sb.WriteString(verdict)
+	}
 
-	// line 3: kernel/local drops + burst summary
-	b := view.Bursts
-	fmt.Fprintf(&sb, "kernel drops: %d   local drops: %d   bursts: %s",
-		view.KernelDrops, view.LocalDrops,
-		agg.FormatBurstSummary(b.Ten99, b.HundredUp, b.Max))
-
-	return renderSection(titleLeft, headerStyle, sb.String(), width)
+	return renderRule(titleLeft, headerStyle, sb.String(), width)
 }
 
 // renderReverseKPI is the secondary KPI card surfaced only when the
@@ -129,9 +174,9 @@ func renderReverseKPI(view *agg.StreamView, width int) string {
 		return ""
 	}
 	lossCell := lossColor(view.LossPct).Render(fmt.Sprintf("%.3f%%", view.LossPct))
-	body := fmt.Sprintf("reverse loss  %s   jitter %.2f ms   recv %d   lost %d",
+	body := fmt.Sprintf("  reverse loss  %s   jitter %.2f ms   recv %d   lost %d",
 		lossCell, view.JitterMS, view.Recv, view.Lost)
-	return renderSection("reverse stream (server→client)", headerStyle, body, width)
+	return renderRule("reverse stream (server→client)", headerStyle, body, width)
 }
 
 // renderTCPCorroborateKPI is the diagnostic card for the dedicated TCP
@@ -146,17 +191,17 @@ func renderTCPCorroborateKPI(view *agg.TCPCorroborateView, width int) string {
 		return ""
 	}
 	if !view.Supported {
-		return renderSection("tcp corroborate (probe socket)", headerStyle,
-			"unsupported on this host (TCP_INFO unavailable)", width)
+		return renderRule("tcp corroborate (probe socket)", headerStyle,
+			"  unsupported on this host (TCP_INFO unavailable)", width)
 	}
 	pctCell := lossColor(view.RetransPct).Render(fmt.Sprintf("%.3f%%", view.RetransPct))
-	body := fmt.Sprintf("tcp retransmits %d / %d bytes  (%s)",
+	body := fmt.Sprintf("  tcp retransmits %d / %d bytes  (%s)",
 		view.BytesRetrans, view.BytesOut, pctCell)
 	if view.RttUs > 0 {
 		body += fmt.Sprintf("   rtt %.2f ms (min %.2f ms)",
 			float64(view.RttUs)/1000.0, float64(view.MinRttUs)/1000.0)
 	}
-	return renderSection("tcp corroborate (probe socket)", headerStyle, body, width)
+	return renderRule("tcp corroborate (probe socket)", headerStyle, body, width)
 }
 
 func formatDuration(d time.Duration) string {
@@ -184,7 +229,7 @@ func ladderFor(width int) columnLadder {
 // carry a red "!" prefix on the TTL cell.
 func renderHopTable(hops []agg.HopView, width int) string {
 	if len(hops) == 0 {
-		return renderSection("forward path", headerStyle, dimStyle.Render("(no hops resolved yet)"), width)
+		return renderRule("forward path", headerStyle, "  "+dimStyle.Render("(no hops resolved yet)"), width)
 	}
 	ladder := ladderFor(width)
 	headers := hopHeaders(ladder, "IP")
@@ -241,7 +286,7 @@ func renderHopTable(hops []agg.HopView, width int) string {
 		rows = append(rows, row)
 	}
 	body := buildHopTable(headers, rows)
-	return renderSection("forward path", headerStyle, body, width)
+	return renderRule("forward path", headerStyle, indentBlock(body, 2), width)
 }
 
 // renderReverseHopTable mirrors renderHopTable but for the server's
@@ -255,7 +300,7 @@ func renderReverseHopTable(hops []agg.ReverseHopView, status string, width int) 
 	title := "reverse path" + annStyle.Render(fmt.Sprintf(" (status: %s, %d hops)", control.FriendlyReverseStatus(status), len(hops)))
 
 	if len(hops) == 0 {
-		return renderSection(title, headerStyle, annStyle.Render("(no reverse hops)"), width)
+		return renderRule(title, headerStyle, "  "+annStyle.Render("(no reverse hops)"), width)
 	}
 	ladder := ladderFor(width)
 	headers := hopHeaders(ladder, "Addr")
@@ -300,7 +345,7 @@ func renderReverseHopTable(hops []agg.ReverseHopView, status string, width int) 
 	if hint := leadingFilteredHint(hops); hint != "" {
 		body = dimStyle.Render(hint) + "\n" + body
 	}
-	return renderSection(title, headerStyle, body, width)
+	return renderRule(title, headerStyle, indentBlock(body, 2), width)
 }
 
 // leadingFilteredHint returns a one-line caption when the reverse trace

@@ -10,12 +10,17 @@ import (
 const usage = `dropline — concurrent path tracing and packet-loss tester
 
 Usage:
-  dropline serve [--listen :5301]
+  dropline serve [--listen :5301] [--max-sessions 4]
+                 [--max-rate-bps 1G] [--allow-reverse-stream]
   dropline trace TARGET [--rate 10M] [--duration 60s] [--packet-size 1200]
                         [--mtr-interval 1s] [--max-hops 30]
                         [--tui | --report | --json] [--save FILE]
                         [--reverse-trace auto|on|off]
+                        [--reverse-stream auto|on|off]
+                        [--tcp-corroborate auto|on|off]
+                        [--tcp-corroborate-rate 100K]
   dropline service install [--listen :5301] [--max-sessions 4]
+                           [--max-rate-bps 1G] [--allow-reverse-stream]
   dropline service uninstall
   dropline service run     (invoked by the Windows SCM; not for direct use)
   dropline version

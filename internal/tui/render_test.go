@@ -564,8 +564,8 @@ func TestRenderKPIVerdict(t *testing.T) {
 	if !strings.Contains(localSuspect, "⚠ network loss is suspect") {
 		t.Errorf("expected suspect verdict from LocalDrops alone; got\n%s", localSuspect)
 	}
-	if !strings.Contains(localSuspect, "local drops: 7") {
-		t.Errorf("expected 'local drops: 7' in KPI body; got\n%s", localSuspect)
+	if !strings.Contains(localSuspect, "local drops 7") {
+		t.Errorf("expected 'local drops 7' in KPI body; got\n%s", localSuspect)
 	}
 }
 
@@ -592,7 +592,7 @@ func TestRenderKPIIncludesTitleAndBursts(t *testing.T) {
 	view.Bursts.One = 3
 	view.Bursts.Max = 1
 	got := stripANSI(renderKPI(opts, view, 5*time.Second, false, "[bar]", 100))
-	for _, want := range []string{"dropline · srv.lab", "10.00 Mbps", "bursts:", "recv 4200"} {
+	for _, want := range []string{"dropline · srv.lab", "10.00 Mbps", "bursts ", "recv 4200"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("KPI missing %q; got\n%s", want, got)
 		}

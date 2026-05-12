@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"charm.land/bubbles/v2/help"
-	"charm.land/bubbles/v2/progress"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
@@ -51,8 +50,12 @@ type model struct {
 	// help model fullscreen and skips the dashboard entirely.
 	helpVisible bool
 	help        help.Model
-	progress    progress.Model
-	keys        keyMap
+	// barWidth is the visible width of the elapsed-vs-duration progress
+	// bar in renderKPI. Computed from the terminal width on each
+	// WindowSizeMsg; floored at 10 so the bar keeps a visible nub even
+	// on narrow terminals.
+	barWidth int
+	keys     keyMap
 }
 
 // statusDecay is how long a transient footer status (save / reset /
@@ -63,17 +66,13 @@ const statusDecay = 3 * time.Second
 func newModel(opts Options, snaps <-chan agg.StateSnapshot) model {
 	h := help.New()
 	h.ShowAll = true
-	p := progress.New(
-		progress.WithoutPercentage(),
-		progress.WithColors(lipgloss.Color("12")),
-	)
 	return model{
 		opts:     opts,
 		snaps:    snaps,
 		width:    80,
 		height:   24,
+		barWidth: 45, // 80 - 35; refreshed on first WindowSizeMsg
 		help:     h,
-		progress: p,
 		keys:     newKeyMap(),
 	}
 }
@@ -88,14 +87,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.help.SetWidth(msg.Width)
-		// Reserve room for "elapsed mm:ss  " (15) + "  duration mm:ss"
-		// (16) + section padding/border (4). Floor at 10 so the bar
-		// keeps a visible nub even on narrow terminals.
+		// Reserve room for "  elapsed mm:ss  " + "  duration mm:ss".
+		// Floor at 10 so the bar keeps a visible nub even on narrow
+		// terminals.
 		barW := msg.Width - 35
 		if barW < 10 {
 			barW = 10
 		}
-		m.progress.SetWidth(barW)
+		m.barWidth = barW
 		return m, nil
 	case tea.KeyPressMsg:
 		// In bubbletea v2 keys split into Press / Release events; we
@@ -222,27 +221,40 @@ func (m model) View() tea.View {
 	if pct > 1 {
 		pct = 1
 	}
-	bar := m.progress.ViewAs(pct)
+	bar := renderBar(pct, m.barWidth)
 
-	parts := []string{
+	// Assemble the dashboard zones (everything above the footer). Each
+	// zone is one rule-headed block; consecutive zones get a blank line
+	// between them so the eye has somewhere to rest.
+	sections := []string{
 		renderKPI(m.opts, m.latest.Stream, elapsed, m.paused, bar, m.width),
 	}
 	if rev := renderReverseKPI(m.latest.ReverseStream, m.width); rev != "" {
-		parts = append(parts, rev)
+		sections = append(sections, rev)
 	}
 	if tcp := renderTCPCorroborateKPI(m.latest.TCPCorroborate, m.width); tcp != "" {
-		parts = append(parts, tcp)
+		sections = append(sections, tcp)
 	}
 	if m.width >= 30 {
 		if chart := renderSparkline(m.latest.Buckets, m.width); chart != "" {
-			parts = append(parts, chart)
+			sections = append(sections, chart)
 		}
 	}
-	parts = append(parts,
+	sections = append(sections,
 		renderHopTable(m.latest.LatestForwardHops, m.width),
 		renderReverseHopTable(m.latest.LatestReverseHops, m.latest.ReversePathStatus, m.width),
-		dimStyle.Render("  "+m.footerText()),
 	)
+
+	parts := make([]string, 0, 2*len(sections)+1)
+	for i, s := range sections {
+		if i > 0 {
+			parts = append(parts, "")
+		}
+		parts = append(parts, s)
+	}
+	// Footer is flush against the last zone (no blank line before it)
+	// to keep the keybindings strip from looking orphaned.
+	parts = append(parts, dimStyle.Render("  "+m.footerText()))
 
 	v := tea.NewView(lipgloss.JoinVertical(lipgloss.Left, parts...))
 	v.AltScreen = true
